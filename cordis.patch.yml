@@ -1,0 +1,5 @@
+# Register both WorkBuddy CN and WorkBuddy Global providers in DeepSeek Harness.
+# Reuses the WorkBuddy desktop apps sign-in states without extra configuration.
+- insert:
+    - id: llm-workbuddy-dual
+      name: dsh-workbuddy-dual
