@@ -43,6 +43,10 @@
     "README.md",
     "LICENSE"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JackAIStudio/dsh-workbuddy-dual.git"
+  },
   "license": "MIT",
   "dsh": {
     "bundle": {

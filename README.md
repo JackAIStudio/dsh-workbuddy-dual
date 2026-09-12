@@ -1,7 +1,5 @@
 # DSH WorkBuddy Dual (双轨版)
 
-[English](./README.en.md) | 中文
-
 同时将 **WorkBuddy 国内版（CN）** 与 **WorkBuddy 海外版（Global）** 模型无缝接入 DeepSeek Harness，实现双轨并发、免配置使用。
 
 ## 核心特性
@@ -23,7 +21,11 @@
 
 ## 安装方式
 
-在 DSH Web profile 中以本地插件安装：
+```bash
+dsh plugin --profile web add github:JackAIStudio/dsh-workbuddy-dual
+```
+
+开发机改源码时用本地路径（host 侧 import 了 `@deepseek-ai/*`，必须 `file:`，不要 `link:`）：
 
 ```bash
 dsh plugin --profile web add file:$HOME/Documents/dshspace/plugins/dsh-workbuddy-dual
