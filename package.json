@@ -2,7 +2,7 @@
   "name": "dsh-workbuddy-dual",
   "displayName": "DSH WorkBuddy Dual",
   "description": "同时将 WorkBuddy 国内版与海外版模型无缝接入 DeepSeek Harness，双轨并发、零配置使用。Simultaneously connect WorkBuddy CN and Global models into DeepSeek Harness with zero configuration.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": "JackAIStudio",
   "keywords": [
     "dsh-plugin",
