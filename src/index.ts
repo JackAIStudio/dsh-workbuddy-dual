@@ -91,6 +91,7 @@ export function apply(ctx: Context, config: WorkBuddyDualConfig = {}): void {
         shim,
         catalog,
         resolveAttachments: () => ctx.get('attachments'),
+        mapHostPath: hostPath => ctx.get('fs')?.processPathFromHostPath(hostPath),
       })
       invalidate = workbuddy.invalidate
 

@@ -159,6 +159,16 @@ interface WorkBuddyDualAdapterOptions {
   shim: WorkBuddyDualShim;
   catalog: WorkBuddyDualCatalog;
   resolveAttachments?: () => AttachmentStore | undefined;
+  /**
+   * Map one absolute host path into the current tool execution world.
+   *
+   * Without this, PiAiAdapter cannot resolve a readable path for an attached
+   * image, so the model-facing handle degrades to metadata only and the agent
+   * has to hunt the attachment store on disk to see a picture that was already
+   * in its own context. Mirrors the wiring `dsh-llm-pi-ai` applies to its own
+   * adapter: `(hostPath) => ctx.get('fs')?.processPathFromHostPath(hostPath)`.
+   */
+  mapHostPath?: (hostPath: string) => string | undefined;
 }
 interface WorkBuddyDualAdapter {
   adapter: PiAiAdapter;

@@ -5,7 +5,7 @@
 import { createProvider } from '@earendil-works/pi-ai'
 import type { Api, AuthContext, CredentialStore, Model, ModelThinkingLevel, Provider, ThinkingLevelMap } from '@earendil-works/pi-ai'
 import { openAICompletionsApi } from '@earendil-works/pi-ai/api/openai-completions.lazy'
-import { resolveRetryPolicy } from '@deepseek-ai/dsh-llm'
+import { resolveImageAttachmentAccess, resolveRetryPolicy } from '@deepseek-ai/dsh-llm'
 import type { LlmModelInfo, LlmResolvedModelInfo } from '@deepseek-ai/dsh-llm'
 import { PiAiAdapter, type ResolvedPiAiProviderProfile } from '@deepseek-ai/dsh-llm-pi-ai'
 import type { AttachmentStore } from '@deepseek-ai/dsh-attachment'
@@ -103,6 +103,16 @@ export interface WorkBuddyDualAdapterOptions {
   shim: WorkBuddyDualShim
   catalog: WorkBuddyDualCatalog
   resolveAttachments?: () => AttachmentStore | undefined
+  /**
+   * Map one absolute host path into the current tool execution world.
+   *
+   * Without this, PiAiAdapter cannot resolve a readable path for an attached
+   * image, so the model-facing handle degrades to metadata only and the agent
+   * has to hunt the attachment store on disk to see a picture that was already
+   * in its own context. Mirrors the wiring `dsh-llm-pi-ai` applies to its own
+   * adapter: `(hostPath) => ctx.get('fs')?.processPathFromHostPath(hostPath)`.
+   */
+  mapHostPath?: (hostPath: string) => string | undefined
 }
 
 export interface WorkBuddyDualAdapter {
@@ -111,7 +121,7 @@ export interface WorkBuddyDualAdapter {
 }
 
 export function createWorkBuddyDualAdapter(options: WorkBuddyDualAdapterOptions): WorkBuddyDualAdapter {
-  const { shim, catalog, resolveAttachments } = options
+  const { shim, catalog, resolveAttachments, mapHostPath } = options
 
   const buildModels = (region: WorkBuddyRegion, providerId: string): Model<Api>[] => {
     const baseUrl = shim.baseUrl(region)
@@ -196,6 +206,12 @@ export function createWorkBuddyDualAdapter(options: WorkBuddyDualAdapterOptions)
     auth: INERT_AUTH,
     resolveApiKey: async () => 'dummy-local-bearer',
     ...(resolveAttachments ? { resolveAttachments } : {}),
+    // Resolve the read-only execution-world path recorded beside every image
+    // handle. Omitting this silently downgrades the handle to metadata only,
+    // which is what made the agent go looking for its own attachment on disk.
+    ...(mapHostPath
+      ? { resolveImageAccess: (attachments: AttachmentStore, ref: Parameters<typeof resolveImageAttachmentAccess>[2]) => resolveImageAttachmentAccess(attachments, mapHostPath, ref) }
+      : {}),
   })
 
   return {
