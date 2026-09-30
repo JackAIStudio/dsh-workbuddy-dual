@@ -38,6 +38,30 @@ describe('dsh-workbuddy-dual', () => {
     expect(cred?.region).toBe('cn')
   })
 
+  it('parses real local desktop credentials if available', async () => {
+    const fs = await import('node:fs')
+    const candidates = defaultDesktopCandidatesFor('cn')
+    for (const p of candidates) {
+      if (fs.existsSync(p)) {
+        const content = fs.readFileSync(p, 'utf8')
+        const cred = parseWorkBuddyAuth(content, 'cn')
+        expect(cred).toBeDefined()
+        expect(cred?.accessToken).toMatch(/^[A-Za-z0-9._~+/-]+=*$/)
+        expect(cred?.accessToken.length).toBeGreaterThan(50)
+      }
+    }
+    const glCandidates = defaultDesktopCandidatesFor('global')
+    for (const p of glCandidates) {
+      if (fs.existsSync(p)) {
+        const content = fs.readFileSync(p, 'utf8')
+        const cred = parseWorkBuddyAuth(content, 'global')
+        expect(cred).toBeDefined()
+        expect(cred?.accessToken).toMatch(/^[A-Za-z0-9._~+/-]+=*$/)
+        expect(cred?.accessToken.length).toBeGreaterThan(50)
+      }
+    }
+  })
+
   it('manages dual model catalog correctly', () => {
     const catalog = new WorkBuddyDualCatalog()
     const cnModels = catalog.modelsFor('cn')

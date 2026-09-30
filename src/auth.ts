@@ -13,6 +13,7 @@ import { homedir, release } from 'node:os'
 import { basename, join } from 'node:path'
 import { withFileLock, writeFileAtomic } from '@deepseek-ai/dsh-atomic-write'
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
+import { decryptWbString } from './decrypt.ts'
 import type { WorkBuddyAuthStatus, WorkBuddyCredential, WorkBuddyRegion } from './types.ts'
 
 export interface WorkBuddyRefreshOutcome {
@@ -110,14 +111,14 @@ export function parseWorkBuddyAuth(text: string, defaultRegion: WorkBuddyRegion)
   const auth = (typeof doc['auth'] === 'object' && doc['auth'] !== null ? doc['auth'] : doc) as Record<string, unknown>
   const account = (typeof doc['account'] === 'object' && doc['account'] !== null ? doc['account'] : {}) as Record<string, unknown>
 
-  const accessToken = optionalString(auth['accessToken'])
+  const accessToken = decryptWbString(auth['accessToken'], defaultRegion)
   if (accessToken === undefined) return undefined
 
-  const refreshToken = optionalString(auth['refreshToken']) ?? ''
+  const refreshToken = decryptWbString(auth['refreshToken'], defaultRegion) ?? ''
   const domain = optionalString(auth['domain']) ?? (defaultRegion === 'global' ? 'www.workbuddy.ai' : 'www.codebuddy.cn')
   const uid = optionalString(account['uid']) ?? optionalString(auth['uid']) ?? ''
   const enterpriseId = optionalString(auth['enterpriseId']) ?? optionalString(account['enterpriseId'])
-  const nickname = optionalString(account['nickname']) ?? optionalString(auth['nickname'])
+  const nickname = decryptWbString(account['nickname'] ?? auth['nickname'], defaultRegion)
 
   let expiresAtMs = 0
   const rawExpiresAt = optionalNumber(auth['expiresAt'])

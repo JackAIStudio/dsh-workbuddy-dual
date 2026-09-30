@@ -156,7 +156,7 @@ export function createWorkBuddyDualAdapter(options: WorkBuddyDualAdapterOptions)
       streamIdleTimeoutMs: WORKBUDDY_STREAM_IDLE_TIMEOUT_MS,
       retryPolicy: resolveRetryPolicy(undefined, 'dsh-workbuddy-dual CN retryPolicy'),
       configuredMaxTokens: new Map(),
-      modelErrors: new Map(),
+      ...({ modelErrors: new Map() } as any),
       ...REQUEST_IMAGE_BUDGETS,
       piProvider: cnProvider,
     }
@@ -167,7 +167,7 @@ export function createWorkBuddyDualAdapter(options: WorkBuddyDualAdapterOptions)
       streamIdleTimeoutMs: WORKBUDDY_STREAM_IDLE_TIMEOUT_MS,
       retryPolicy: resolveRetryPolicy(undefined, 'dsh-workbuddy-dual Global retryPolicy'),
       configuredMaxTokens: new Map(),
-      modelErrors: new Map(),
+      ...({ modelErrors: new Map() } as any),
       ...REQUEST_IMAGE_BUDGETS,
       piProvider: globalProvider,
     }
