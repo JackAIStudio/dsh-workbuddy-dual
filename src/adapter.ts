@@ -10,6 +10,7 @@ import type { LlmModelInfo, LlmResolvedModelInfo } from '@deepseek-ai/dsh-llm'
 import { PiAiAdapter, type ResolvedPiAiProviderProfile } from '@deepseek-ai/dsh-llm-pi-ai'
 import type { AttachmentStore } from '@deepseek-ai/dsh-attachment'
 import type { WorkBuddyDualCatalog } from './catalog.ts'
+import { normalizeReasoning } from './reasoning.ts'
 import type { WorkBuddyDualShim } from './shim.ts'
 import type { WorkBuddyModelInfo, WorkBuddyRegion } from './types.ts'
 
@@ -67,19 +68,40 @@ function withCatalogDisplay(name: string, info: WorkBuddyModelInfo): string {
   return suffix === undefined ? name : `${name} · ${suffix}`
 }
 
-function reasoningFields(info: WorkBuddyModelInfo): { reasoning: boolean; thinkingLevelMap?: ThinkingLevelMap } {
+/**
+ * Publish the selectable thinking levels of one model to pi-ai.
+ *
+ * A level is only selectable in the Harness when its `thinkingLevelMap` entry
+ * is non-null, so models whose catalog entry carries a bare `effort` default
+ * with no `supportedEfforts` list would otherwise advertise `off` as their
+ * only level and lose the thinking-strength control entirely. `normalizeReasoning`
+ * supplies those levels; `off` stays selectable only when the provider allows
+ * disabling thinking, because mapping `off` also drops `reasoning_effort`
+ * from the request.
+ */
+export function reasoningFields(info: WorkBuddyModelInfo): { reasoning: boolean; thinkingLevelMap?: ThinkingLevelMap } {
   const reasoning = info.reasoning
   if (!reasoning || !reasoning.supports) return { reasoning: false }
-  const efforts = reasoning.supportedEfforts
-  if (!efforts || efforts.length === 0) return { reasoning: false }
+
+  const normalized = normalizeReasoning({
+    id: info.id,
+    supports: reasoning.supports,
+    supportedEfforts: reasoning.supportedEfforts,
+    defaultEffort: reasoning.defaultEffort,
+    canDisableThinking: reasoning.canDisableThinking,
+  })
+  if (!normalized.selectable) return { reasoning: false }
+
+  const selectable = new Set<string>(normalized.levels)
+  const wire = (level: string): string | null => (selectable.has(level) ? level : null)
   const map: Record<ModelThinkingLevel, string | null> = {
     off: reasoning.canDisableThinking === true ? 'off' : null,
-    minimal: null,
-    low: efforts.includes('low') ? 'low' : null,
-    medium: efforts.includes('medium') ? 'medium' : null,
-    high: efforts.includes('high') ? 'high' : null,
-    xhigh: efforts.includes('xhigh') ? 'xhigh' : null,
-    max: efforts.includes('max') ? 'max' : null,
+    minimal: wire('minimal'),
+    low: wire('low'),
+    medium: wire('medium'),
+    high: wire('high'),
+    xhigh: wire('xhigh'),
+    max: wire('max'),
   }
   return { reasoning: true, thinkingLevelMap: map as ThinkingLevelMap }
 }

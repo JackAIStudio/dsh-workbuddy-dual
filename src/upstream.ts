@@ -123,6 +123,70 @@ async function readEnvelope(response: Response): Promise<{ code: number; msg?: s
   }
 }
 
+export function parseCatalogModels(rawList: readonly unknown[], region: WorkBuddyRegion): WorkBuddyModelInfo[] {
+  const result: WorkBuddyModelInfo[] = []
+  for (const item of rawList) {
+    if (typeof item !== 'object' || item === null) continue
+    const m = item as Record<string, unknown>
+    const id = typeof m['id'] === 'string' ? m['id'] : ''
+    if (!id || m['disabled'] === true) continue
+
+    const name = typeof m['name'] === 'string' && m['name'] ? m['name'] : id
+    const contextWindow = typeof m['maxInputTokens'] === 'number' ? m['maxInputTokens'] : (typeof m['maxAllowedSize'] === 'number' ? m['maxAllowedSize'] : 200_000)
+    const maxTokens = typeof m['maxOutputTokens'] === 'number' ? m['maxOutputTokens'] : 32_000
+    const supportsImages = m['supportsImages'] === true && m['disabledMultimodal'] !== true
+
+    // Reasoning
+    let reasoning: WorkBuddyModelInfo['reasoning']
+    if (typeof m['reasoning'] === 'object' && m['reasoning'] !== null) {
+      const r = m['reasoning'] as Record<string, unknown>
+      const supportedEfforts = Array.isArray(r['supportedEfforts']) ? r['supportedEfforts'].filter((x): x is string => typeof x === 'string') : undefined
+      // `effort` is the catalog's advertised default and is also published at
+      // the top level by some catalog revisions.
+      const declaredEffort = [r['defaultEffort'], r['effort'], m['defaultEffort']]
+        .find((value): value is string => typeof value === 'string' && value.trim() !== '')
+      reasoning = {
+        supports: true,
+        onlyReasoning: m['onlyReasoning'] === true,
+        supportedEfforts,
+        defaultEffort: declaredEffort,
+        canDisableThinking: r['canDisableThinking'] === true,
+      }
+    } else if (m['supportsReasoning'] === true) {
+      reasoning = { supports: true, onlyReasoning: m['onlyReasoning'] === true }
+    }
+
+    // Billing & badges
+    const credits = typeof m['credits'] === 'string' ? m['credits'] : undefined
+    const badges: string[] = []
+    if (Array.isArray(m['tags'])) {
+      for (const tag of m['tags']) {
+        if (typeof tag === 'string') {
+          if (tag.startsWith('badge:')) {
+            const parts = tag.split(':')
+            if (parts[1]) badges.push(parts[1])
+          } else if (tag === '限时免费' || tag === 'Free now') {
+            badges.push(tag)
+          }
+        }
+      }
+    }
+    const free = credits === 'x0.00' || credits === 'x0.00 credits' || badges.includes('限时免费') || badges.includes('Free now')
+
+    result.push({
+      id,
+      name,
+      contextWindow,
+      maxTokens,
+      supportsImages,
+      reasoning,
+      billing: { credits, badges: badges.length > 0 ? badges : undefined, free },
+      region,
+    })
+  }
+  return result
+}
+
 export class WorkBuddyUpstreamClient {
   async chatStream(
     credential: WorkBuddyCredential,
@@ -191,7 +255,7 @@ export class WorkBuddyUpstreamClient {
         if (env.code === 0 && typeof env.data === 'object' && env.data !== null) {
           const cfg = env.data as Record<string, unknown>
           if (Array.isArray(cfg['models']) && cfg['models'].length > 0) {
-            return this.parseModelsList(cfg['models'], region)
+            return parseCatalogModels(cfg['models'], region)
           }
         }
       }
@@ -214,73 +278,13 @@ export class WorkBuddyUpstreamClient {
         if (env.code === 0 && typeof env.data === 'object' && env.data !== null) {
           const data = env.data as Record<string, unknown>
           if (Array.isArray(data['models'])) {
-            return this.parseModelsList(data['models'], region)
+            return parseCatalogModels(data['models'], region)
           }
         }
       }
     }
 
     throw new Error(`Failed to fetch models for ${region}`)
-  }
-
-  private parseModelsList(rawList: unknown[], region: WorkBuddyRegion): WorkBuddyModelInfo[] {
-    const result: WorkBuddyModelInfo[] = []
-    for (const item of rawList) {
-      if (typeof item !== 'object' || item === null) continue
-      const m = item as Record<string, unknown>
-      const id = typeof m['id'] === 'string' ? m['id'] : ''
-      if (!id || m['disabled'] === true) continue
-
-      const name = typeof m['name'] === 'string' && m['name'] ? m['name'] : id
-      const contextWindow = typeof m['maxInputTokens'] === 'number' ? m['maxInputTokens'] : (typeof m['maxAllowedSize'] === 'number' ? m['maxAllowedSize'] : 200_000)
-      const maxTokens = typeof m['maxOutputTokens'] === 'number' ? m['maxOutputTokens'] : 32_000
-      const supportsImages = m['supportsImages'] === true && m['disabledMultimodal'] !== true
-
-      // Reasoning
-      let reasoning: WorkBuddyModelInfo['reasoning']
-      if (typeof m['reasoning'] === 'object' && m['reasoning'] !== null) {
-        const r = m['reasoning'] as Record<string, unknown>
-        const supportedEfforts = Array.isArray(r['supportedEfforts']) ? r['supportedEfforts'].filter((x): x is string => typeof x === 'string') : undefined
-        reasoning = {
-          supports: true,
-          onlyReasoning: m['onlyReasoning'] === true,
-          supportedEfforts,
-          defaultEffort: typeof r['defaultEffort'] === 'string' ? r['defaultEffort'] : (typeof r['effort'] === 'string' ? r['effort'] : undefined),
-          canDisableThinking: r['canDisableThinking'] === true,
-        }
-      } else if (m['supportsReasoning'] === true) {
-        reasoning = { supports: true, onlyReasoning: m['onlyReasoning'] === true }
-      }
-
-      // Billing & badges
-      const credits = typeof m['credits'] === 'string' ? m['credits'] : undefined
-      const badges: string[] = []
-      if (Array.isArray(m['tags'])) {
-        for (const tag of m['tags']) {
-          if (typeof tag === 'string') {
-            if (tag.startsWith('badge:')) {
-              const parts = tag.split(':')
-              if (parts[1]) badges.push(parts[1])
-            } else if (tag === '限时免费' || tag === 'Free now') {
-              badges.push(tag)
-            }
-          }
-        }
-      }
-      const free = credits === 'x0.00' || credits === 'x0.00 credits' || badges.includes('限时免费') || badges.includes('Free now')
-
-      result.push({
-        id,
-        name,
-        contextWindow,
-        maxTokens,
-        supportsImages,
-        reasoning,
-        billing: { credits, badges: badges.length > 0 ? badges : undefined, free },
-        region,
-      })
-    }
-    return result
   }
 
   async fetchCredits(credential: WorkBuddyCredential): Promise<WorkBuddyCredits> {

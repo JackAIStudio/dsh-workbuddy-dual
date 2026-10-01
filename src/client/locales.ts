@@ -1,4 +1,5 @@
 export const en = {
+  nav: 'WorkBuddy Dual',
   title: 'DSH WorkBuddy Dual',
   intro: 'Simultaneously connect WorkBuddy CN and Global models into DeepSeek Harness — dual-track, zero configuration.',
   expand: 'Expand',
@@ -19,6 +20,7 @@ export const en = {
 export type WorkBuddyDualSettingsKey = keyof typeof en
 
 export const zh: Record<WorkBuddyDualSettingsKey, string> = {
+  nav: 'WorkBuddy 双轨',
   title: 'DSH WorkBuddy Dual (双轨版)',
   intro: '同时接入 WorkBuddy 国内版与海外版模型，双轨并发、免配置使用。',
   expand: '展开',

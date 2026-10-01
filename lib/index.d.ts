@@ -1,4 +1,5 @@
 import z from "@deepseek-ai/schemastery";
+import "@earendil-works/pi-ai";
 import { PiAiAdapter } from "@deepseek-ai/dsh-llm-pi-ai";
 import { Context } from "@deepseek-ai/cordis";
 import { AttachmentStore } from "@deepseek-ai/dsh-attachment";
@@ -130,7 +131,6 @@ declare class WorkBuddyUpstreamClient {
   chatStream(credential: WorkBuddyCredential, bodyJson: string, signal?: AbortSignal): Promise<WorkBuddyChatResult>;
   refreshToken(credential: WorkBuddyCredential): Promise<WorkBuddyRefreshOutcome>;
   fetchModels(credential: WorkBuddyCredential): Promise<readonly WorkBuddyModelInfo[]>;
-  private parseModelsList;
   fetchCredits(credential: WorkBuddyCredential): Promise<WorkBuddyCredits>;
 }
 //#endregion

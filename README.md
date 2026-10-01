@@ -5,8 +5,11 @@
 ## 核心特性
 
 - **双轨并发 (Dual Provider)**：同时向 DSH 注册两个独立的提供商：
-  - `workbuddy-cn`：对应国内版（中国大陆），包含 `Deepseek-V4.1-Flash` (x0.03 独家优惠)、`Hy3` (x0.00 限时免费)、`GLM-5.3` (可调思考强度) 等模型。
-  - `workbuddy-global`：对应海外版（Global），包含 `Deepseek-V4.1-Flash` (x0.00 免积分)、`GPT-6-Astra`、`GPT-5.5`、`Gemini-3.5-Flash` 等模型。
+  - `workbuddy-cn`：对应国内版（中国大陆），模型目录由 `/v3/config` 动态下发（当前 31 个模型，含 `Kimi-K3`、`GLM-5.3`、`DeepSeek-V4.1-Flash` 等）。
+  - `workbuddy-global`：对应海外版（Global），目录同样动态下发（当前 29 个模型，含 `GPT-6-Astra`、`GPT-5.6-Sol`、`Gemini-3.5-Flash` 等）。
+- **思考强度可选 (Thinking Levels)**：按目录下发的 `supportedEfforts` 在 DSH 模型选择器里暴露可选档位（低 / 中 / 高 / 超高 / 极致）。
+  - 目录只给单个 `effort` 默认值、没给档位列表的模型（例如 `Kimi-K3`、`DeepSeek-V4.1-Flash`、`MiniMax-M3`、`Gemini-3.5-Flash`），按模型家族补一套客户端档位，不再退化成"只有 off"。实测国内版 31 个模型里 27 个可选强度。
+  - `canDisableThinking: false` 的模型不提供"关闭思考"，避免选到无效档位。
 - **自动双凭证发现 (Zero Configuration)**：
   - 自动探测并读取本地已登录凭据：
     - 国内版：`CodeBuddyExtension/.../auth/workbuddy-desktop.info`
