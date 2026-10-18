@@ -9,6 +9,9 @@ import type {
   WorkBuddyRegion,
 } from './types.ts'
 import type { WorkBuddyRefreshOutcome } from './auth.ts'
+import { randomBytes, randomUUID } from 'node:crypto'
+import { execFileSync } from 'node:child_process'
+import { existsSync } from 'node:fs'
 
 export type UpstreamErrorKind = 'auth' | 'credit' | 'rate' | 'client' | 'server' | 'not_found'
 
@@ -20,8 +23,12 @@ const CN_CHAT_BASE = 'https://copilot.tencent.com'
 const CN_BILLING_BASE = 'https://www.codebuddy.cn'
 const GLOBAL_BASE = 'https://www.workbuddy.ai'
 
-const CLIENT_UA_CN = 'CLI/2.63.2 CodeBuddy/2.63.2'
-const CLIENT_UA_GLOBAL = 'WorkBuddy/5.3.14 WorkBuddy/5.3.14 CLI/2.115.0'
+const FALLBACK_APP_VERSION = { cn: '5.8.3', global: '5.6.2' } as const
+const APP_INFO_PLIST = {
+  cn: '/Applications/WorkBuddy.app/Contents/Info.plist',
+  global: '/Applications/WorkBuddy AI.app/Contents/Info.plist',
+} as const
+const CLI_VERSION = { cn: '2.63.2', global: '2.115.0' } as const
 
 const JSON_TIMEOUT_MS = 30_000
 const ERROR_BODY_LIMIT = 4096
@@ -54,19 +61,64 @@ function originReferer(region: WorkBuddyRegion): string {
   return region === 'global' ? GLOBAL_BASE : CN_BILLING_BASE
 }
 
+/** Read the installed WorkBuddy app version; the gateway checks this header. */
+function appVersion(region: WorkBuddyRegion): string {
+  const plist = APP_INFO_PLIST[region]
+  if (existsSync(plist)) {
+    try {
+      const value = execFileSync('/usr/libexec/PlistBuddy', ['-c', 'Print :CFBundleShortVersionString', plist], {
+        encoding: 'utf8', timeout: 2000, stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim()
+      if (value) return value
+    } catch {}
+  }
+  return FALLBACK_APP_VERSION[region]
+}
+
+function clientUserAgent(region: WorkBuddyRegion): string {
+  const version = appVersion(region)
+  return region === 'global'
+    ? `WorkBuddy/${version} WorkBuddy/${version} CLI/${CLI_VERSION.global}`
+    : `CLI/${CLI_VERSION.cn} CodeBuddy/${CLI_VERSION.cn}`
+}
+
+/** The official gateway's trace triplet shares one trace id. */
+function gatewayRequestHeaders(): Record<string, string> {
+  const traceId = randomBytes(16).toString('hex')
+  const spanId = randomBytes(8).toString('hex')
+  const parentSpanId = randomBytes(8).toString('hex')
+  return {
+    'x-requested-with': 'XMLHttpRequest',
+    'x-codebuddy-request': '1',
+    'X-Conversation-ID': randomUUID(),
+    'X-Conversation-Request-ID': randomUUID(),
+    'X-Conversation-Message-ID': randomUUID(),
+    'X-Request-ID': randomUUID(),
+    'acp-connection-id': randomUUID(),
+    'X-Agent-Intent': 'craft',
+    'X-Agent-Purpose': 'conversation',
+    'traceparent': `00-${traceId}-${spanId}-01`,
+    'b3': `${traceId}-${spanId}-1-${parentSpanId}`,
+    'X-B3-TraceId': traceId,
+    'X-B3-ParentSpanId': parentSpanId,
+    'X-B3-SpanId': spanId,
+    'X-B3-Sampled': '1',
+    'X-Trace-ID': traceId,
+  }
+}
+
 function commonHeaders(credential: WorkBuddyCredential): Record<string, string> {
-  const isGlobal = credential.region === 'global'
+  const version = appVersion(credential.region)
   return {
     'Accept': 'application/json, text/plain, */*',
     'Origin': originReferer(credential.region),
     'Referer': `${originReferer(credential.region)}/`,
-    'User-Agent': isGlobal ? CLIENT_UA_GLOBAL : CLIENT_UA_CN,
-    ...(isGlobal ? {
-      'X-IDE-Type': 'WorkBuddy',
-      'X-IDE-Name': 'WorkBuddy',
-      'X-IDE-Version': '5.3.14',
-      'X-Product-Version': '5.3.14',
-    } : {}),
+    'User-Agent': clientUserAgent(credential.region),
+    'X-IDE-Type': 'WorkBuddy',
+    'X-IDE-Name': 'WorkBuddy',
+    'X-IDE-Version': version,
+    'X-Product-Version': version,
+    'X-Private-Data': 'true',
   }
 }
 
@@ -75,6 +127,7 @@ function chatHeaders(credential: WorkBuddyCredential): Record<string, string> {
     ...commonHeaders(credential),
     'Content-Type': 'application/json',
     'X-Product': 'SaaS',
+    ...gatewayRequestHeaders(),
     ...(credential.uid ? { 'X-User-Id': credential.uid } : { 'X-No-User-Id': '1' }),
     ...(credential.enterpriseId ? { 'X-Enterprise-Id': credential.enterpriseId } : { 'X-No-Enterprise-Id': '1' }),
     'X-Domain': credential.domain || (credential.region === 'global' ? 'www.workbuddy.ai' : 'www.codebuddy.cn'),
@@ -269,7 +322,7 @@ export class WorkBuddyUpstreamClient {
           'Accept': 'application/json',
           'Origin': originReferer(region),
           'Referer': `${originReferer(region)}/`,
-          'User-Agent': CLIENT_UA_CN,
+          'User-Agent': clientUserAgent(region),
         },
         signal: AbortSignal.timeout(JSON_TIMEOUT_MS),
       })
