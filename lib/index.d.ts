@@ -61,11 +61,41 @@ interface WorkBuddyModelInfo {
   region: WorkBuddyRegion;
 }
 //#endregion
+//#region src/model-paths.d.ts
+type WorkBuddyLaneMode = 'all' | 'selected';
+/** Stored per-lane preference. `all` ignores `models`; `selected` uses them. */
+interface WorkBuddyLanePreference {
+  enabled: boolean;
+  mode: WorkBuddyLaneMode;
+  models: readonly string[];
+}
+//#endregion
+//#region src/selection.d.ts
+type WorkBuddyDualSelection = Record<WorkBuddyRegion, WorkBuddyLanePreference>;
+/** Fresh selection for a deployment with no stored preference. */
+declare function defaultSelection(): WorkBuddyDualSelection;
+/** Normalize one lane: de-duplicated trimmed ids, `all` carries no list. */
+declare function normalizeLanePreference(input: unknown): WorkBuddyLanePreference;
+/** Normalize a whole selection document, keeping valid per-lane defaults. */
+declare function normalizeSelection(input: unknown): WorkBuddyDualSelection;
+/** Filter one lane's full catalog into what the model pickers should show. */
+declare function filterModels(models: readonly WorkBuddyModelInfo[], lane: WorkBuddyLanePreference): readonly WorkBuddyModelInfo[];
+/** The exact ids a lane currently advertises, for tests and diagnostics. */
+declare function advertisedModelIds(models: readonly WorkBuddyModelInfo[], lane: WorkBuddyLanePreference): string[];
+//#endregion
 //#region src/catalog.d.ts
 declare class WorkBuddyDualCatalog {
   private cnModels;
   private globalModels;
+  private live;
+  private selection;
+  /** Every model the upstream catalogs know about, before user filtering. */
   modelsFor(region: WorkBuddyRegion): readonly WorkBuddyModelInfo[];
+  /** Models the harness is allowed to advertise; optional when open. */
+  selectedModelsFor(region: WorkBuddyRegion): readonly WorkBuddyModelInfo[];
+  setSelection(selection: WorkBuddyDualSelection): void;
+  /** Whether the upstream catalog has answered for this lane (vs. fallback). */
+  isLive(region: WorkBuddyRegion): boolean;
   setModels(region: WorkBuddyRegion, models: readonly WorkBuddyModelInfo[]): void;
 }
 //#endregion
@@ -176,6 +206,31 @@ interface WorkBuddyDualAdapter {
 }
 declare function createWorkBuddyDualAdapter(options: WorkBuddyDualAdapterOptions): WorkBuddyDualAdapter;
 //#endregion
+//#region src/selection-store.d.ts
+interface WorkBuddyDualSelectionStoreOptions {
+  /** Override the document path (tests and unusual deployments). */
+  path?: string | undefined;
+}
+/** Reads and writes the selection document with atomic replacement. */
+declare class WorkBuddyDualSelectionStore {
+  private readonly path;
+  private cached;
+  private loaded;
+  constructor(options?: WorkBuddyDualSelectionStoreOptions);
+  /** Absolute document path; surfaced by diagnostics only. */
+  get documentPath(): string;
+  /** Current selection, refreshing from disk when it might have changed. */
+  get(): Promise<WorkBuddyDualSelection>;
+  /** Persist a whole selection after normalizing it. */
+  replace(selection: WorkBuddyDualSelection): Promise<WorkBuddyDualSelection>;
+  /** Merge one lane's patch into the stored preference. */
+  updateLanes(patch: {
+    cn?: Partial<WorkBuddyLanePreference> | undefined;
+    global?: Partial<WorkBuddyLanePreference> | undefined;
+  }): Promise<WorkBuddyDualSelection>;
+  private load;
+}
+//#endregion
 //#region src/index.d.ts
 declare const WORKBUDDY_DUAL_SETTINGS_NS = "workbuddy-dual";
 interface WorkBuddyDualConfig {
@@ -187,4 +242,4 @@ declare const name = "dsh-workbuddy-dual";
 declare const inject: readonly ["llm"];
 declare function apply(ctx: Context, config?: WorkBuddyDualConfig): void;
 //#endregion
-export { Config, WORKBUDDY_CN_PROVIDER, WORKBUDDY_DUAL_SETTINGS_NS, WORKBUDDY_GLOBAL_PROVIDER, WorkBuddyDualCatalog, WorkBuddyDualConfig, WorkBuddyDualCredentialStore, WorkBuddyUpstreamClient, apply, createWorkBuddyDualAdapter, createWorkBuddyDualShim, inject, name };
+export { Config, WORKBUDDY_CN_PROVIDER, WORKBUDDY_DUAL_SETTINGS_NS, WORKBUDDY_GLOBAL_PROVIDER, WorkBuddyDualCatalog, WorkBuddyDualConfig, WorkBuddyDualCredentialStore, type WorkBuddyDualSelection, WorkBuddyDualSelectionStore, WorkBuddyUpstreamClient, advertisedModelIds, apply, createWorkBuddyDualAdapter, createWorkBuddyDualShim, defaultSelection, filterModels, inject, name, normalizeLanePreference, normalizeSelection };

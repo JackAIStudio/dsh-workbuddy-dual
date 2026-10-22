@@ -9,6 +9,11 @@ import { resolveImageAttachmentAccess, resolveRetryPolicy } from '@deepseek-ai/d
 import type { LlmModelInfo, LlmResolvedModelInfo } from '@deepseek-ai/dsh-llm'
 import { PiAiAdapter, type ResolvedPiAiProviderProfile } from '@deepseek-ai/dsh-llm-pi-ai'
 import type { AttachmentStore } from '@deepseek-ai/dsh-attachment'
+import {
+  MAX_REQUEST_IMAGE_BYTES,
+  REQUEST_IMAGE_MAX_BYTES,
+  REQUEST_IMAGE_PIXEL_BUDGET,
+} from './budget.ts'
 import type { WorkBuddyDualCatalog } from './catalog.ts'
 import { normalizeReasoning } from './reasoning.ts'
 import type { WorkBuddyDualShim } from './shim.ts'
@@ -19,10 +24,19 @@ export const WORKBUDDY_GLOBAL_PROVIDER = 'workbuddy-global'
 
 export const WORKBUDDY_STREAM_IDLE_TIMEOUT_MS = 300_000
 
+/**
+ * Per-request image budgets, all derived from the gateway's body cap.
+ *
+ * `maxRequestImageBytes` counts base64 image payload only, while the system
+ * prompt, tool catalog, and conversation text ride outside it. Setting it
+ * above the gateway's whole-body limit meant it could never trip, so the
+ * harness never received the `IMAGE_OFFLOAD_REQUIRED` code that makes it drop
+ * old screenshots. The numbers live in budget.ts next to the cap they defend.
+ */
 const REQUEST_IMAGE_BUDGETS = {
-  maxRequestImageBytes: 20_971_520,
-  requestImagePixelBudget: 4_194_304,
-  requestImageMaxBytes: 1_048_576,
+  maxRequestImageBytes: MAX_REQUEST_IMAGE_BYTES,
+  requestImagePixelBudget: REQUEST_IMAGE_PIXEL_BUDGET,
+  requestImageMaxBytes: REQUEST_IMAGE_MAX_BYTES,
 } as const
 
 const NO_COST = {

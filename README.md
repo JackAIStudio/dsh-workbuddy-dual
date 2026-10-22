@@ -30,6 +30,11 @@
   - 国内网关会对 system 提示词做渠道校验：提示词里带着别家 Harness 的品牌串时，请求在模型调用前就被拒绝，返回 `400 / 11128 Illegal API invocation from an unapproved channel`。典型现象是所有模型都发不出消息，但用一个简单 system 提示词却能通。
   - Loopback 在转发前只改写 system 消息里的这一处品牌串（`DeepSeek Harness` → `DeepSeek-Harness`），语义不变，用户自己的消息内容不动。
   - 该问题与请求头、工具表、模型、账号额度、推理档位都无关；换哪个模型都会同样被拦。
+- **长会话请求体积防护（413 / 图片自动卸载）**：
+  - 两个网关都在约 16 MB 处拒收整个请求体，但报错会伪装成别的问题：国内版返回 `400 / 11133 Invalid request parameters`，海外版返回裸 `500`，都不提体积。
+  - 插件把 `maxRequestImageBytes` 设在网关上限以下（约束见 [`src/budget.ts`](./src/budget.ts)），所以长会话在撑爆网关**之前**就会拿到 `IMAGE_OFFLOAD_REQUIRED`，由 DSH 内置的 `dsh-compaction-image-offload` 把最老的截图换成占位符并自动重试。历史越长越会丢旧图，但会话能继续跑下去。
+  - Loopback 自身仍保留一道兜底：超过 24 MiB 的请求体直接返回 `413 / request_too_large`，并带上实际字节数，不再伪装成 500。
+  - 请求体超过 12 MiB 会写一行尺寸日志；上游在体积临界点拒绝时，日志里会把状态码和字节数配对打印，便于下次一眼定位。
 
 ## 安装方式
 

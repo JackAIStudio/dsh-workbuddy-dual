@@ -4,6 +4,7 @@
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
+import { GATEWAY_BODY_LIMIT_BYTES, MAX_REQUEST_BODY_BYTES } from './budget.ts'
 import type { WorkBuddyDualCredentialStore } from './auth.ts'
 import type { WorkBuddyDualCatalog } from './catalog.ts'
 import { hostIsLoopback, originIsLoopback } from './loopback.ts'
@@ -22,6 +23,28 @@ export interface WorkBuddyDualShimOptions {
   client: WorkBuddyUpstreamClient
   catalog: WorkBuddyDualCatalog
   logger?: { info: (msg: string, ...args: unknown[]) => void; error: (msg: string, ...args: unknown[]) => void }
+}
+
+/** Bodies above this size are logged, because they are one image away from the gateway cap. */
+const REQUEST_BODY_WARN_BYTES = 12 * 1024 * 1024
+
+/**
+ * A request body the shim refuses to buffer.
+ *
+ * Carrying the numbers on the error lets the HTTP layer answer 413 with the
+ * real size instead of collapsing into a generic 500, which used to hide the
+ * fact that nothing ever reached the upstream.
+ */
+export class RequestBodyTooLargeError extends Error {
+  readonly receivedBytes: number
+  readonly limitBytes: number
+
+  constructor(receivedBytes: number, limitBytes: number) {
+    super(`Request body reached ${receivedBytes} bytes, above the ${limitBytes}-byte shim limit`)
+    this.name = 'RequestBodyTooLargeError'
+    this.receivedBytes = receivedBytes
+    this.limitBytes = limitBytes
+  }
 }
 
 function writeJson(res: ServerResponse, status: number, body: unknown): void {
@@ -50,6 +73,44 @@ function isJsonContentType(req: IncomingMessage): boolean {
 }
 
 /**
+ * Log only the bodies that are large enough to matter.
+ *
+ * A gateway rejection at 15.5 MB is indistinguishable from a parameter bug in
+ * its own error text, so the size has to reach the log while the failure is
+ * still attributable. Quiet bodies stay quiet: one line per small request
+ * would bury the signal.
+ */
+type ShimLogger = WorkBuddyDualShimOptions['logger']
+
+function logBodySize(logger: ShimLogger, region: WorkBuddyRegion, bytes: number): void {
+  if (bytes < REQUEST_BODY_WARN_BYTES) return
+  logger?.info(
+    `[workbuddy-dual] ${region} request body ${bytes} bytes (${(bytes / 1024 / 1024).toFixed(2)} MiB)`,
+  )
+}
+
+/**
+ * Attribute an upstream rejection to the body size when the two coincide.
+ *
+ * WorkBuddy answers an oversized body with a generic `Invalid request
+ * parameters` or a bare 413, never naming the limit. Pairing the status with
+ * the exact byte count is what makes that diagnosis possible next time.
+ */
+function logUpstreamRejection(
+  logger: ShimLogger,
+  region: WorkBuddyRegion,
+  bytes: number,
+  status: number,
+  message: string,
+): void {
+  const oversized = status === 413 || (bytes >= GATEWAY_BODY_LIMIT_BYTES && (status === 400 || status === 500))
+  if (!oversized) return
+  logger?.error(
+    `[workbuddy-dual] ${region} gateway rejected a ${bytes}-byte body with ${status}; bodies above roughly ${GATEWAY_BODY_LIMIT_BYTES} bytes are refused with generic parameter errors. ${message.slice(0, 200)}`,
+  )
+}
+
+/**
  * The CN gateway runs a channel check over the system prompt, not over the
  * headers or tool list alone: a prompt that still carries another vendor's
  * harness signature is rejected with 11128 "Illegal API invocation from an
@@ -63,13 +124,13 @@ export function stripForeignHarnessSignature(source: string): string {
   return source.replace(HARNESS_SIGNATURE, 'DeepSeek-Harness')
 }
 
-async function readBody(req: IncomingMessage, limit = 16 * 1024 * 1024): Promise<Buffer> {
+async function readBody(req: IncomingMessage, limit = MAX_REQUEST_BODY_BYTES): Promise<Buffer> {
   const chunks: Buffer[] = []
   let total = 0
   for await (const chunk of req) {
     const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
     total += buf.length
-    if (total > limit) throw new Error('Request body exceeds limit')
+    if (total > limit) throw new RequestBodyTooLargeError(total, limit)
     chunks.push(buf)
   }
   return Buffer.concat(chunks)
@@ -217,7 +278,26 @@ export function createWorkBuddyDualShim(options: WorkBuddyDualShimOptions): Work
       return
     }
 
-    const raw = (await readBody(req)).toString('utf8')
+    let body: Buffer
+    try {
+      body = await readBody(req)
+    } catch (err: unknown) {
+      if (err instanceof RequestBodyTooLargeError) {
+        // A 413 names the real problem. The previous generic 500 read as an
+        // upstream failure and sent debugging to WorkBuddy instead of here.
+        writeOpenAIError(
+          res,
+          413,
+          'request_too_large',
+          `Request body is ${err.receivedBytes} bytes, above the ${err.limitBytes}-byte local shim limit. Reduce retained images or start a new task.`,
+        )
+        return
+      }
+      throw err
+    }
+
+    logBodySize(logger, region, body.length)
+    const raw = body.toString('utf8')
     const prepared = prepareChatBody(raw)
 
     const controller = new AbortController()
@@ -225,6 +305,7 @@ export function createWorkBuddyDualShim(options: WorkBuddyDualShimOptions): Work
 
     const result = await client.chatStream(credential, prepared, controller.signal)
     if (!result.ok) {
+      logUpstreamRejection(logger, region, body.length, result.status, result.message)
       const status = result.status >= 400 && result.status < 600 ? result.status : 502
       writeOpenAIError(res, status, result.kind, result.message)
       return
