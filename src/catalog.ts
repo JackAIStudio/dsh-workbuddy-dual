@@ -3,6 +3,7 @@
  */
 
 import type { WorkBuddyModelInfo, WorkBuddyRegion } from './types.ts'
+import { filterModels, type WorkBuddyDualSelection } from './selection.ts'
 
 export const FALLBACK_CN_MODELS: readonly WorkBuddyModelInfo[] = [
   {
@@ -143,16 +144,37 @@ export const FALLBACK_GLOBAL_MODELS: readonly WorkBuddyModelInfo[] = [
 export class WorkBuddyDualCatalog {
   private cnModels: readonly WorkBuddyModelInfo[] = FALLBACK_CN_MODELS
   private globalModels: readonly WorkBuddyModelInfo[] = FALLBACK_GLOBAL_MODELS
+  private live = { cn: false, global: false }
+  private selection: WorkBuddyDualSelection | undefined
 
+  /** Every model the upstream catalogs know about, before user filtering. */
   modelsFor(region: WorkBuddyRegion): readonly WorkBuddyModelInfo[] {
     return region === 'cn' ? this.cnModels : this.globalModels
+  }
+
+  /** Models the harness is allowed to advertise; optional when open. */
+  selectedModelsFor(region: WorkBuddyRegion): readonly WorkBuddyModelInfo[] {
+    const selection = this.selection
+    if (!selection) return this.modelsFor(region)
+    return filterModels(this.modelsFor(region), selection[region])
+  }
+
+  setSelection(selection: WorkBuddyDualSelection): void {
+    this.selection = selection
+  }
+
+  /** Whether the upstream catalog has answered for this lane (vs. fallback). */
+  isLive(region: WorkBuddyRegion): boolean {
+    return this.live[region]
   }
 
   setModels(region: WorkBuddyRegion, models: readonly WorkBuddyModelInfo[]): void {
     if (region === 'cn') {
       this.cnModels = [...models]
+      this.live = { ...this.live, cn: true }
     } else {
       this.globalModels = [...models]
+      this.live = { ...this.live, global: true }
     }
   }
 }

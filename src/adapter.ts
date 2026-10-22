@@ -147,6 +147,9 @@ export function createWorkBuddyDualAdapter(options: WorkBuddyDualAdapterOptions)
 
   const buildModels = (region: WorkBuddyRegion, providerId: string): Model<Api>[] => {
     const baseUrl = shim.baseUrl(region)
+    // The provider carries the complete catalog so a Session that already uses
+    // a model hidden by the user can still resolve it. `listModels` is what
+    // narrows the picker.
     return catalog.modelsFor(region).map(info => toPiModel(info, baseUrl, providerId))
   }
 
@@ -206,8 +209,9 @@ export function createWorkBuddyDualAdapter(options: WorkBuddyDualAdapterOptions)
     override async listModels(provider: string): Promise<readonly LlmModelInfo[]> {
       const models = await super.listModels(provider)
       const region: WorkBuddyRegion = provider === WORKBUDDY_GLOBAL_PROVIDER ? 'global' : 'cn'
-      const catalogModels = catalog.modelsFor(region)
-      return models.map(m => {
+      const catalogModels = catalog.selectedModelsFor(region)
+      const allowed = new Set(catalogModels.map(info => info.id))
+      return models.filter(m => allowed.has(m.id)).map(m => {
         const info = catalogModels.find(x => x.id === m.id)
         if (!info) return m
         return { ...m, name: withCatalogDisplay(m.name, info) }
@@ -217,6 +221,8 @@ export function createWorkBuddyDualAdapter(options: WorkBuddyDualAdapterOptions)
     override async resolveModel(provider: string, model: string, signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
       const resolved = await super.resolveModel(provider, model, signal)
       const region: WorkBuddyRegion = provider === WORKBUDDY_GLOBAL_PROVIDER ? 'global' : 'cn'
+      // Resolution stays open to the whole catalog: a Session created before
+      // the user narrowed the list must still finish with its chosen model.
       const info = catalog.modelsFor(region).find(x => x.id === model)
       if (!info) return resolved
       return { ...resolved, name: withCatalogDisplay(resolved.name, info) }

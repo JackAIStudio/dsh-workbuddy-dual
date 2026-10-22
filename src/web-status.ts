@@ -53,7 +53,7 @@ async function resolveRegionWebStatus(
     return { status: 'signed-out', region }
   }
 
-  const models = deps.catalog.modelsFor(region)
+  const models = deps.catalog.selectedModelsFor(region)
   const modelsBadge: WorkBuddyWebModelBadge[] = models
     .filter(m => m.billing?.free === true || (m.billing?.badges?.length ?? 0) > 0)
     .map(m => ({

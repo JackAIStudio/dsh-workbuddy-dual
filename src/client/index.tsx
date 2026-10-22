@@ -4,6 +4,7 @@ import type {} from '@deepseek-ai/dsh-client-locale/client'
 import type {} from '@deepseek-ai/dsh-client-ui-slots'
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 import { WorkBuddyDualCard, type WorkBuddyDualCardInjected } from './DualPluginCard.tsx'
+import { ModelPicker } from './ModelPicker.tsx'
 import { en, zh, type WorkBuddyDualSettingsKey } from './locales.ts'
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {
@@ -64,6 +65,7 @@ function WorkBuddySettingsSection({ t }: WorkBuddySettingsSectionProps) {
         </p>
       </header>
       <WorkBuddyDualCard t={t} />
+      <ModelPicker t={t} />
     </div>
   )
 }

@@ -8,6 +8,7 @@ import { WorkBuddyUpstreamClient } from './upstream.ts'
 import { FALLBACK_CN_MODELS, FALLBACK_GLOBAL_MODELS } from './catalog.ts'
 import { WORKBUDDY_DUAL_VERSION } from './version.ts'
 import { isHeartbeatProcessAlive, readHostHeartbeat } from './host-heartbeat.ts'
+import { WorkBuddyDualSelectionStore } from './selection-store.ts'
 
 type Action = 'doctor' | 'logout' | 'status'
 
@@ -46,6 +47,7 @@ async function doctor(jsonOutput: boolean): Promise<number> {
 
   const heartbeat = await readHostHeartbeat()
   const hostAlive = heartbeat !== undefined && isHeartbeatProcessAlive(heartbeat)
+  const selection = await new WorkBuddyDualSelectionStore().get()
 
   const report = {
     schemaVersion: JSON_SCHEMA_VERSION,
@@ -54,12 +56,14 @@ async function doctor(jsonOutput: boolean): Promise<number> {
     node: process.version,
     cn: {
       signIn: cnStatus.state,
+      modelVisibility: selection.cn.enabled ? selection.cn.mode : 'disabled',
       desktopAuthFilePresent: cnDesktopPresent,
       candidates: store.cn.resolveDesktopCandidates(),
       fallbackModels: FALLBACK_CN_MODELS.length,
     },
     global: {
       signIn: globalStatus.state,
+      modelVisibility: selection.global.enabled ? selection.global.mode : 'disabled',
       desktopAuthFilePresent: globalDesktopPresent,
       candidates: store.global.resolveDesktopCandidates(),
       fallbackModels: FALLBACK_GLOBAL_MODELS.length,
@@ -73,14 +77,18 @@ async function doctor(jsonOutput: boolean): Promise<number> {
   if (jsonOutput) {
     printJson(report)
   } else {
+    const selectionLabel = (lane: { enabled: boolean; mode: string }): string =>
+      !lane.enabled ? 'disabled' : lane.mode === 'all' ? 'all models' : 'selected models'
     process.stdout.write([
       `WorkBuddy Dual ${WORKBUDDY_DUAL_VERSION} on ${process.version}`,
       '--- [CN / 国内版] ---',
       `  Sign-in state: ${cnStatus.state}`,
+      `  Model visibility: ${selectionLabel(selection.cn)}`,
       `  Desktop auth file: ${cnDesktopPresent ? 'present' : 'missing'}`,
       `  Fallback models: ${FALLBACK_CN_MODELS.length}`,
       '--- [Global / 海外版] ---',
       `  Sign-in state: ${globalStatus.state}`,
+      `  Model visibility: ${selectionLabel(selection.global)}`,
       `  Desktop auth file: ${globalDesktopPresent ? 'present' : 'missing'}`,
       `  Fallback models: ${FALLBACK_GLOBAL_MODELS.length}`,
       '------------------------',

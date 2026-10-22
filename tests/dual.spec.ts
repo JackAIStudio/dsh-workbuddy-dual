@@ -4,11 +4,41 @@ import type { WorkBuddyModelInfo } from '../src/types.ts'
 import { normalizeReasoning } from '../src/reasoning.ts'
 import { WorkBuddyDualCatalog } from '../src/catalog.ts'
 import { defaultDesktopCandidatesFor, parseWorkBuddyAuth } from '../src/auth.ts'
-import { createWorkBuddyDualShim } from '../src/shim.ts'
+import { createWorkBuddyDualShim, prepareChatBody, stripForeignHarnessSignature } from '../src/shim.ts'
 import { WorkBuddyDualCredentialStore } from '../src/auth.ts'
 import { WorkBuddyUpstreamClient, parseCatalogModels } from '../src/upstream.ts'
+import {
+  advertisedModelIds,
+  defaultSelection,
+  filterModels,
+  normalizeLanePreference,
+  normalizeModelIds,
+  normalizeSelection,
+} from '../src/selection.ts'
+import { WorkBuddyDualSelectionStore } from '../src/selection-store.ts'
+import { laneModelsView, parseUpdate } from '../src/model-route.ts'
 
 describe('dsh-workbuddy-dual', () => {
+  it('drops the foreign harness signature from the system prompt only', () => {
+    const body = JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      messages: [
+        { role: 'developer', content: 'You are an AI agent powered by DeepSeek Harness.' },
+        { role: 'user', content: [{ type: 'text', text: 'DeepSeek Harness 是什么？' }] },
+      ],
+    })
+    const prepared = JSON.parse(prepareChatBody(body)) as { messages: Array<Record<string, unknown>> }
+    expect(prepared.messages[0]?.['content']).toBe('You are an AI agent powered by DeepSeek-Harness.')
+    // User text is the user's own content and must survive untouched.
+    expect(prepared.messages[1]?.['content']).toEqual([{ type: 'text', text: 'DeepSeek Harness 是什么？' }])
+    expect(prepared.messages[0]?.['role']).toBe('system')
+  })
+
+  it('normalizes the signature across spacing and casing', () => {
+    expect(stripForeignHarnessSignature('powered by deepseek   harness')).toBe('powered by DeepSeek-Harness')
+    expect(stripForeignHarnessSignature('DeepSeek-Harness')).toBe('DeepSeek-Harness')
+  })
+
   it('detects desktop candidates for both regions', () => {
     const cnCandidates = defaultDesktopCandidatesFor('cn')
     const globalCandidates = defaultDesktopCandidatesFor('global')
@@ -106,6 +136,12 @@ describe('dsh-workbuddy-dual', () => {
       expect(glJson.object).toBe('list')
       expect(glJson.data.some(m => m.id === 'gpt-6-astra')).toBe(true)
       expect(glJson.data.every(m => m.owned_by === 'workbuddy-global')).toBe(true)
+
+      // The shim is the wire the model pickers ultimately read through, so a
+      // narrowed lane must narrow here too — not only in the adapter.
+      catalog.setSelection(normalizeSelection({ cn: { mode: 'selected', models: ['hy3'] } }))
+      const narrowed = (await (await fetch(`${shim.origin}/cn/v1/models`)).json()) as { data: { id: string }[] }
+      expect(narrowed.data.map(model => model.id)).toEqual(['hy3'])
     } finally {
       await shim.close()
     }
@@ -188,5 +224,111 @@ describe('thinking levels', () => {
     expect(parsed[0]?.reasoning).toMatchObject({ supports: true, defaultEffort: 'medium', canDisableThinking: false })
     expect(parsed[1]?.reasoning).toMatchObject({ supportedEfforts: ['low', 'high', 'max'], defaultEffort: 'high' })
     expect(thinkingLevels(parsed[2]!)).toEqual(['high', 'xhigh'])
+  })
+})
+
+describe('model selection', () => {
+  it('leaves both lanes fully open when nothing is stored', () => {
+    const catalog = new WorkBuddyDualCatalog()
+    const selection = defaultSelection()
+    const cn = catalog.modelsFor('cn')
+    const global = catalog.modelsFor('global')
+
+    expect(advertisedModelIds(cn, selection.cn)).toEqual(cn.map(model => model.id))
+    expect(advertisedModelIds(global, selection.global)).toEqual(global.map(model => model.id))
+  })
+
+  it('narrows a lane to the chosen ids only', () => {
+    const catalog = new WorkBuddyDualCatalog()
+    const cn = catalog.modelsFor('cn')
+    const lane = normalizeLanePreference({ mode: 'selected', models: ['deepseek-v4.1-flash'] })
+
+    expect(filterModels(cn, lane).map(model => model.id)).toEqual(['deepseek-v4.1-flash'])
+    expect(advertisedModelIds(cn, lane)).not.toContain('glm-5.3')
+  })
+
+  it('hides a lane entirely when it is disabled', () => {
+    const catalog = new WorkBuddyDualCatalog()
+    const lane = normalizeLanePreference({ enabled: false, mode: 'all' })
+    expect(advertisedModelIds(catalog.modelsFor('global'), lane)).toEqual([])
+  })
+
+  it('treats an empty explicit list as “show everything”', () => {
+    // An older plugin wrote `[]` for “no selection”. It must not blank the
+    // picker after an upgrade.
+    expect(normalizeLanePreference({}).mode).toBe('all')
+    expect(normalizeLanePreference({ models: [] }).mode).toBe('all')
+    expect(normalizeLanePreference({ mode: 'selected', models: [] }).mode).toBe('selected')
+  })
+
+  it('normalizes ids and tolerates a hand-edited document', () => {
+    expect(normalizeModelIds([' glm-5.3 ', 'glm-5.3', '', 'hy3'])).toEqual(['glm-5.3', 'hy3'])
+    const selection = normalizeSelection({ cn: { mode: 'selected', models: ['hy3'] }, global: 'nonsense' })
+    expect(selection.cn.models).toEqual(['hy3'])
+    expect(selection.global).toEqual({ enabled: true, mode: 'all', models: [] })
+  })
+
+  it('reports checked rows for a selected lane and all rows for an open lane', () => {
+    const catalog = new WorkBuddyDualCatalog()
+    const narrow = normalizeSelection({ cn: { mode: 'selected', models: ['hy3'] } })
+    const view = laneModelsView(catalog, narrow, 'cn')
+
+    expect(view.mode).toBe('selected')
+    expect(view.selectedCount).toBe(1)
+    expect(view.models.filter(model => model.selected).map(model => model.id)).toEqual(['hy3'])
+
+    const open = laneModelsView(catalog, defaultSelection(), 'cn')
+    expect(open.mode).toBe('all')
+    expect(open.selectedCount).toBe(open.total)
+  })
+
+  it('rejects a malformed write instead of guessing', () => {
+    expect(() => parseUpdate({ cn: { mode: 'nope' } })).toThrow(/mode/)
+    expect(() => parseUpdate({ cn: { enabled: 'yes' } })).toThrow(/enabled/)
+    expect(() => parseUpdate({ cn: { models: [1] } })).toThrow(/models/)
+    expect(parseUpdate({ cn: { mode: 'selected', models: ['hy3'] } })).toEqual({
+      cn: { mode: 'selected', models: ['hy3'] },
+    })
+  })
+
+
+  it('disables the global lane without touching the CN lane', () => {
+    const catalog = new WorkBuddyDualCatalog()
+    const selection = normalizeSelection({
+      cn: { mode: 'selected', models: ['hy3'] },
+      global: { enabled: false, mode: 'all' },
+    })
+    catalog.setSelection(selection)
+
+    expect(catalog.selectedModelsFor('cn').map(model => model.id)).toEqual(['hy3'])
+    expect(catalog.selectedModelsFor('global')).toEqual([])
+    // The unfiltered catalog stays available to finish an old Session.
+    expect(catalog.modelsFor('global').length).toBeGreaterThan(0)
+  })
+})
+
+describe('selection document', () => {
+  it('round-trips through an atomic file and defaults when absent', async () => {
+    const fs = await import('node:fs/promises')
+    const os = await import('node:os')
+    const path = await import('node:path')
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'workbuddy-dual-'))
+    const doc = path.join(dir, 'models.json')
+    try {
+      const store = new WorkBuddyDualSelectionStore({ path: doc })
+      expect(await store.get()).toEqual(defaultSelection())
+
+      await store.updateLanes({ cn: { mode: 'selected', models: ['hy3', 'glm-5.3'] } })
+      const reopened = new WorkBuddyDualSelectionStore({ path: doc })
+      const stored = await reopened.get()
+      expect(stored.cn).toEqual({ enabled: true, mode: 'selected', models: ['hy3', 'glm-5.3'] })
+      // The untouched lane keeps its open default.
+      expect(stored.global).toEqual(defaultSelection().global)
+
+      const parsed = JSON.parse(await fs.readFile(doc, 'utf8')) as { version: number }
+      expect(parsed.version).toBe(1)
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true })
+    }
   })
 })

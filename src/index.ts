@@ -12,6 +12,9 @@ import type {} from '@deepseek-ai/dsh-llm'
 import type {} from '@deepseek-ai/dsh-settings'
 import { WorkBuddyDualCredentialStore } from './auth.ts'
 import { WorkBuddyDualCatalog } from './catalog.ts'
+import { WorkBuddyDualSelectionStore } from './selection-store.ts'
+import type { WorkBuddyDualSelection } from './selection.ts'
+import { registerWorkBuddyDualModelRoutes } from './model-route.ts'
 import {
   createWorkBuddyDualAdapter,
   WORKBUDDY_CN_PROVIDER,
@@ -31,6 +34,15 @@ export { WorkBuddyDualCredentialStore } from './auth.ts'
 export { WorkBuddyDualCatalog } from './catalog.ts'
 export { WorkBuddyUpstreamClient } from './upstream.ts'
 export { createWorkBuddyDualShim } from './shim.ts'
+export { WorkBuddyDualSelectionStore } from './selection-store.ts'
+export {
+  defaultSelection,
+  filterModels,
+  normalizeLanePreference,
+  normalizeSelection,
+  advertisedModelIds,
+  type WorkBuddyDualSelection,
+} from './selection.ts'
 
 export const WORKBUDDY_DUAL_SETTINGS_NS = 'workbuddy-dual'
 
@@ -57,10 +69,32 @@ export function apply(ctx: Context, config: WorkBuddyDualConfig = {}): void {
   })
 
   const catalog = new WorkBuddyDualCatalog()
+  const selection = new WorkBuddyDualSelectionStore()
   const shim = createWorkBuddyDualShim({ store, client, catalog, logger: ctx.logger })
+
+  let stopped = false
+  let invalidate: (() => void) | undefined
+
+  /** Rebuild the adapter generation and tell every picker to re-read. */
+  const publishSelection = (next: WorkBuddyDualSelection): void => {
+    catalog.setSelection(next)
+    invalidate?.()
+    ctx.events.emit('llm/adapters-updated')
+  }
 
   ctx.inject(['webServer'], webCtx => {
     registerWorkBuddyDualStatusRoute(webCtx, { store, client, catalog })
+    registerWorkBuddyDualModelRoutes(webCtx, {
+      catalog,
+      selection,
+      async accountStatus(region) {
+        const status = await store.storeFor(region).status()
+        return status.state === 'signed-in' ? 'signed-in' : 'signed-out'
+      },
+      onChange(next) {
+        publishSelection(next)
+      },
+    })
   })
 
   let currentConfig = () => config
@@ -75,7 +109,6 @@ export function apply(ctx: Context, config: WorkBuddyDualConfig = {}): void {
     })
   })
 
-  let stopped = false
   ctx.effect(() => () => {
     stopped = true
     void shim.close()
@@ -85,7 +118,6 @@ export function apply(ctx: Context, config: WorkBuddyDualConfig = {}): void {
   void shim.ready.then(() => {
     if (stopped) return
 
-    let invalidate: (() => void) | undefined
     try {
       const workbuddy = createWorkBuddyDualAdapter({
         shim,
@@ -94,6 +126,9 @@ export function apply(ctx: Context, config: WorkBuddyDualConfig = {}): void {
         mapHostPath: hostPath => ctx.get('fs')?.processPathFromHostPath(hostPath),
       })
       invalidate = workbuddy.invalidate
+      // The stored selection must be in the catalog before the first
+      // listModels read, so the picker opens with exactly the user's choice.
+      void selection.get().then(publishSelection)
 
       let releaseAdapter: (() => void) | undefined
       let releaseDirectory: (() => void) | undefined

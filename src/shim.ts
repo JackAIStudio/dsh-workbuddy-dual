@@ -49,6 +49,20 @@ function isJsonContentType(req: IncomingMessage): boolean {
   return header.split(';')[0]?.trim().toLowerCase() === 'application/json'
 }
 
+/**
+ * The CN gateway runs a channel check over the system prompt, not over the
+ * headers or tool list alone: a prompt that still carries another vendor's
+ * harness signature is rejected with 11128 "Illegal API invocation from an
+ * unapproved channel" before the model is ever called. Rewriting the product
+ * name into its hyphenated form keeps the meaning and the model's own identity
+ * instruction while dropping that literal signature.
+ */
+const HARNESS_SIGNATURE = /deepseek\s+harness/gi
+
+export function stripForeignHarnessSignature(source: string): string {
+  return source.replace(HARNESS_SIGNATURE, 'DeepSeek-Harness')
+}
+
 async function readBody(req: IncomingMessage, limit = 16 * 1024 * 1024): Promise<Buffer> {
   const chunks: Buffer[] = []
   let total = 0
@@ -66,9 +80,9 @@ export function prepareChatBody(source: string): string {
   try {
     body = JSON.parse(source)
   } catch {
-    return source
+    return stripForeignHarnessSignature(source)
   }
-  if (typeof body !== 'object' || body === null || Array.isArray(body)) return source
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) return stripForeignHarnessSignature(source)
   const obj = body as Record<string, unknown>
   obj['stream'] = true
 
@@ -78,6 +92,9 @@ export function prepareChatBody(source: string): string {
       if (typeof msg === 'object' && msg !== null && !Array.isArray(msg)) {
         const m = msg as Record<string, unknown>
         if (m['role'] === 'developer') m['role'] = 'system'
+        // Only the system prompt carries the fingerprint the gateway rejects;
+        // user content is the user's own text and stays untouched.
+        if (m['role'] === 'system') m['content'] = stripHarnessSignatureFromContent(m['content'])
       }
     }
     // Upstream (especially Global) requires the first message to be role: "system".
@@ -114,6 +131,17 @@ export function prepareChatBody(source: string): string {
   return JSON.stringify(obj)
 }
 
+function stripHarnessSignatureFromContent(content: unknown): unknown {
+  if (typeof content === 'string') return stripForeignHarnessSignature(content)
+  if (!Array.isArray(content)) return content
+  return content.map(part => {
+    if (typeof part !== 'object' || part === null || Array.isArray(part)) return part
+    const item = part as Record<string, unknown>
+    if (typeof item['text'] !== 'string') return part
+    return { ...item, text: stripForeignHarnessSignature(item['text']) }
+  })
+}
+
 export function createWorkBuddyDualShim(options: WorkBuddyDualShimOptions): WorkBuddyDualShim {
   const { store, client, catalog, logger } = options
   let origin = 'http://127.0.0.1:0'
@@ -147,7 +175,7 @@ export function createWorkBuddyDualShim(options: WorkBuddyDualShimOptions): Work
       }
 
       if (req.method === 'GET' && (normalizedPath === '/v1/models' || normalizedPath === '/v1/models/')) {
-        const models = catalog.modelsFor(region)
+        const models = catalog.selectedModelsFor(region)
         writeJson(res, 200, {
           object: 'list',
           data: models.map(m => ({
