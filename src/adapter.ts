@@ -5,7 +5,7 @@
 import { createProvider } from '@earendil-works/pi-ai'
 import type { Api, AuthContext, CredentialStore, Model, ModelThinkingLevel, Provider, ThinkingLevelMap } from '@earendil-works/pi-ai'
 import { openAICompletionsApi } from '@earendil-works/pi-ai/api/openai-completions.lazy'
-import { resolveImageAttachmentAccess, resolveRetryPolicy } from '@deepseek-ai/dsh-llm'
+import { ReasoningEffortId, resolveImageAttachmentAccess, resolveRetryPolicy } from '@deepseek-ai/dsh-llm'
 import type { LlmModelInfo, LlmResolvedModelInfo } from '@deepseek-ai/dsh-llm'
 import { PiAiAdapter, type ResolvedPiAiProviderProfile } from '@deepseek-ai/dsh-llm-pi-ai'
 import type { AttachmentStore } from '@deepseek-ai/dsh-attachment'
@@ -80,6 +80,51 @@ function displaySuffix(info: WorkBuddyModelInfo): string | undefined {
 function withCatalogDisplay(name: string, info: WorkBuddyModelInfo): string {
   const suffix = displaySuffix(info)
   return suffix === undefined ? name : `${name} · ${suffix}`
+}
+
+/**
+ * Attach the model's strongest thinking level as its default.
+ *
+ * pi-ai carries no per-model default; `PiAiAdapter` copies the provider
+ * profile's configured effort into `reasoning.defaultEffort` and leaves it
+ * out when the profile has none. WorkBuddy profiles configure no level, so
+ * every model reached the Harness without a default and the picker fell back
+ * to the first advertised tier (`Off` or `Low`) — even for models that offer
+ * Max. Publishing the top tier makes a model switch start where the model is
+ * strongest; an explicit choice still overrides it per request.
+ */
+export function withDefaultEffort(
+  resolved: LlmResolvedModelInfo,
+  info: WorkBuddyModelInfo | undefined,
+): LlmResolvedModelInfo {
+  if (info === undefined || resolved.reasoning === undefined) return resolved
+  const top = topEffort(resolved.reasoning.efforts)
+  if (top === undefined) return resolved
+  if (resolved.reasoning.defaultEffort === ReasoningEffortId(top)) return resolved
+  return { ...resolved, reasoning: { ...resolved.reasoning, defaultEffort: ReasoningEffortId(top) } }
+}
+
+/**
+ * Strongest thinking level the model advertises.
+ *
+ * Known levels rank by ascending effort and `off` never wins. Tiers outside the
+ * standard vocabulary rank with the top tier, since vendors name their highest
+ * setting after themselves (`extra-high`).
+ */
+export function topEffort(efforts: readonly { id: string }[]): string | undefined {
+  const order = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']
+  let top: string | undefined
+  let topRank = -2
+  for (const effort of efforts) {
+    if (effort.id === 'off') continue
+    const known = order.indexOf(effort.id)
+    const rank = known === -1 ? order.indexOf('max') + 0.5 : known
+    if (rank > topRank) {
+      topRank = rank
+      top = effort.id
+    }
+  }
+  return top
 }
 
 /**
@@ -239,7 +284,24 @@ export function createWorkBuddyDualAdapter(options: WorkBuddyDualAdapterOptions)
       // the user narrowed the list must still finish with its chosen model.
       const info = catalog.modelsFor(region).find(x => x.id === model)
       if (!info) return resolved
-      return { ...resolved, name: withCatalogDisplay(resolved.name, info) }
+      return withDefaultEffort(
+        { ...resolved, name: withCatalogDisplay(resolved.name, info) },
+        info,
+      )
+    }
+
+    /**
+     * `PiAiAdapter.prepareCall` builds its metadata through a private
+     * `modelInfo`, bypassing the `resolveModel` override above. Without this
+     * the picker shows the top tier while a request without an explicit effort
+     * still leaves the level to the provider's own (often weaker) default.
+     */
+    override async prepareCall(provider: string, model: string, signal?: AbortSignal) {
+      const prepared = await super.prepareCall(provider, model, signal)
+      const region: WorkBuddyRegion = provider === WORKBUDDY_GLOBAL_PROVIDER ? 'global' : 'cn'
+      const info = catalog.modelsFor(region).find(x => x.id === model)
+      if (!info) return prepared
+      return { ...prepared, model: withDefaultEffort(prepared.model, info) }
     }
   }
 

@@ -1,12 +1,16 @@
 import { describe, expect, it } from 'vitest'
-import { reasoningFields } from '../src/adapter.ts'
+import { reasoningFields, topEffort, withDefaultEffort } from '../src/adapter.ts'
+import type { LlmResolvedModelInfo } from '@deepseek-ai/dsh-llm'
+import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { WorkBuddyModelInfo } from '../src/types.ts'
 import { normalizeReasoning } from '../src/reasoning.ts'
 import { WorkBuddyDualCatalog } from '../src/catalog.ts'
 import { defaultDesktopCandidatesFor, parseWorkBuddyAuth } from '../src/auth.ts'
 import { createWorkBuddyDualShim, prepareChatBody, stripForeignHarnessSignature } from '../src/shim.ts'
 import { WorkBuddyDualCredentialStore } from '../src/auth.ts'
-import { WorkBuddyUpstreamClient, parseCatalogModels } from '../src/upstream.ts'
+import { WorkBuddyUpstreamClient, parseBusinessCode, parseCatalogModels, parseResetTime } from '../src/upstream.ts'
+import { WorkBuddyAccountPool } from '../src/accounts.ts'
+import type { WorkBuddyCredential } from '../src/types.ts'
 import {
   advertisedModelIds,
   defaultSelection,
@@ -17,6 +21,7 @@ import {
 } from '../src/selection.ts'
 import { WorkBuddyDualSelectionStore } from '../src/selection-store.ts'
 import { laneModelsView, parseUpdate } from '../src/model-route.ts'
+import { workBuddyAccountHandler, createAccountRouteState, displayNameFor, maskUid, parseAccountAction } from '../src/account-route.ts'
 
 describe('dsh-workbuddy-dual', () => {
   it('drops the foreign harness signature from the system prompt only', () => {
@@ -225,6 +230,49 @@ describe('thinking levels', () => {
     expect(parsed[1]?.reasoning).toMatchObject({ supportedEfforts: ['low', 'high', 'max'], defaultEffort: 'high' })
     expect(thinkingLevels(parsed[2]!)).toEqual(['high', 'xhigh'])
   })
+
+  it('publishes the strongest level as the model default so a switch starts at the top', () => {
+    // pi-ai carries no per-model default, so without this every WorkBuddy model
+    // reached the picker with no default and the composer fell back to the
+    // first advertised level (`off` or `low`) after a model switch.
+    const resolved = {
+      provider: 'workbuddy-cn',
+      id: 'deepseek-v4.1-flash',
+      name: 'Deepseek-V4.1-Flash',
+      inputModalities: ['text' as const],
+      context: { contextWindow: 1_000_000 },
+      reasoning: {
+        efforts: [
+          { id: 'low', name: 'Low' },
+          { id: 'high', name: 'High' },
+          { id: 'max', name: 'Max' },
+        ],
+      },
+    } as unknown as LlmResolvedModelInfo
+    const info: WorkBuddyModelInfo = {
+      id: 'deepseek-v4.1-flash',
+      name: 'Deepseek-V4.1-Flash',
+      contextWindow: 1_000_000,
+      maxTokens: 128_000,
+      supportsImages: true,
+      reasoning: { supports: true, onlyReasoning: true, canDisableThinking: false },
+      region: 'cn',
+    }
+    expect(withDefaultEffort(resolved, info)).toMatchObject({
+      reasoning: { defaultEffort: 'max' },
+    })
+    // A weaker inherited default is overridden: switching models should not
+    // land on Low while the model still offers Max.
+    const configured = {
+      ...resolved,
+      reasoning: { ...resolved.reasoning, defaultEffort: ReasoningEffortId('low') },
+    } as LlmResolvedModelInfo
+    expect(withDefaultEffort(configured, info))
+      .toMatchObject({ reasoning: { defaultEffort: 'max' } })
+    expect(topEffort([{ id: 'off' }, { id: 'minimal' }, { id: 'xhigh' }])).toBe('xhigh')
+    expect(topEffort([{ id: 'low' }, { id: 'high' }, { id: 'extra-high' }])).toBe('extra-high')
+    expect(topEffort([])).toBeUndefined()
+  })
 })
 
 describe('model selection', () => {
@@ -328,6 +376,353 @@ describe('selection document', () => {
       const parsed = JSON.parse(await fs.readFile(doc, 'utf8')) as { version: number }
       expect(parsed.version).toBe(1)
     } finally {
+      await fs.rm(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('account pool', () => {
+  const credential = (uid: string, expiresAtMs = Date.now() + 3_600_000): WorkBuddyCredential => ({
+    accessToken: `access-${uid}`,
+    refreshToken: `refresh-${uid}`,
+    expiresAtMs,
+    domain: 'www.codebuddy.cn',
+    uid,
+    nickname: `name-${uid}`,
+    source: 'pool',
+    region: 'cn',
+  })
+
+  it('adds, selects, and persists accounts across processes', async () => {
+    const fs = await import('node:fs/promises')
+    const os = await import('node:os')
+    const path = await import('node:path')
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'workbuddy-pool-'))
+    const doc = path.join(dir, 'accounts-cn.json')
+    try {
+      const pool = new WorkBuddyAccountPool('cn', { path: doc })
+      expect((await pool.get()).accounts).toEqual([])
+
+      // A first add is also a selection: importing an account is pointless if
+      // the harness keeps spending the previous one.
+      await pool.upsert(credential('u1'))
+      const afterFirst = await pool.get()
+      expect(afterFirst.activeUid).toBe('u1')
+
+      // A second add must not steal the selection.
+      await pool.upsert(credential('u2'), { select: false })
+      expect((await pool.get()).activeUid).toBe('u1')
+      expect((await pool.get()).accounts.map(a => a.uid)).toEqual(['u1', 'u2'])
+
+      // Another host (same file, separate process state) reads the selection.
+      const reopened = new WorkBuddyAccountPool('cn', { path: doc })
+      expect((await reopened.active())?.uid).toBe('u1')
+
+      await reopened.select('u2')
+      expect((await pool.get()).activeUid).toBe('u2')
+
+      const removed = await pool.remove('u2')
+      expect(removed.accounts.map(a => a.uid)).toEqual(['u1'])
+      // Removing the selected account leaves no stale pointer behind.
+      expect(removed.activeUid).toBeUndefined()
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('refuses to select an account it does not hold', async () => {
+    const fs = await import('node:fs/promises')
+    const os = await import('node:os')
+    const path = await import('node:path')
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'workbuddy-pool-'))
+    try {
+      const pool = new WorkBuddyAccountPool('cn', { path: path.join(dir, 'accounts-cn.json') })
+      await pool.upsert(credential('u1'))
+      await expect(pool.select('nope')).rejects.toThrow(/not in the cn pool/)
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps a refreshed token in the pool entry that owns it', async () => {
+    const fs = await import('node:fs/promises')
+    const os = await import('node:os')
+    const path = await import('node:path')
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'workbuddy-pool-'))
+    try {
+      const pool = new WorkBuddyAccountPool('cn', { path: path.join(dir, 'accounts-cn.json') })
+      await pool.upsert(credential('u1'))
+      await pool.update('u1', { ...credential('u1'), accessToken: 'rotated', refreshToken: 'rotated-refresh' })
+      const stored = await pool.find('u1')
+      expect(stored?.accessToken).toBe('rotated')
+      expect(stored?.refreshToken).toBe('rotated-refresh')
+      // Identity and provenance survive a token rotation.
+      expect(stored?.addedAt).toBeLessThanOrEqual(Date.now())
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('credential resolution with a pool', () => {
+  it('prefers the selected pool account over the desktop sign-in', async () => {
+    const fs = await import('node:fs/promises')
+    const os = await import('node:os')
+    const path = await import('node:path')
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'workbuddy-pool-'))
+    const desktopFile = path.join(dir, 'desktop.info')
+    const poolFile = path.join(dir, 'accounts-cn.json')
+    try {
+      await fs.writeFile(desktopFile, JSON.stringify({
+        auth: { accessToken: 'desktop-token', refreshToken: 'r', expiresIn: 3600 },
+        account: { uid: 'desktop-uid' },
+      }))
+      const store = new WorkBuddyDualCredentialStore({
+        refreshCN: async () => ({ accessToken: 'x' }),
+        refreshGlobal: async () => ({ accessToken: 'x' }),
+        cnPathOverride: desktopFile,
+        poolPaths: { cn: poolFile },
+      })
+
+      // No selection yet: the desktop sign-in is what the harness spends.
+      expect((await store.cn.current())?.accessToken).toBe('desktop-token')
+
+      await store.poolFor('cn').upsert({
+        accessToken: 'pool-token',
+        refreshToken: 'r2',
+        expiresAtMs: Date.now() + 3_600_000,
+        domain: 'www.codebuddy.cn',
+        uid: 'pool-uid',
+        nickname: 'Pool account',
+        source: 'pool',
+        region: 'cn',
+      })
+
+      const current = await store.cn.current()
+      expect(current?.accessToken).toBe('pool-token')
+      expect(current?.source).toBe('pool')
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('falls back to the desktop sign-in when the selection is cleared', async () => {
+    const fs = await import('node:fs/promises')
+    const os = await import('node:os')
+    const path = await import('node:path')
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'workbuddy-pool-'))
+    const desktopFile = path.join(dir, 'desktop.info')
+    try {
+      await fs.writeFile(desktopFile, JSON.stringify({
+        auth: { accessToken: 'desktop-token', refreshToken: 'r', expiresIn: 3600 },
+        account: { uid: 'desktop-uid' },
+      }))
+      const store = new WorkBuddyDualCredentialStore({
+        refreshCN: async () => ({ accessToken: 'x' }),
+        refreshGlobal: async () => ({ accessToken: 'x' }),
+        cnPathOverride: desktopFile,
+        poolPaths: { cn: path.join(dir, 'accounts-cn.json') },
+      })
+      await store.poolFor('cn').upsert({
+        accessToken: 'pool-token',
+        refreshToken: 'r2',
+        expiresAtMs: Date.now() + 3_600_000,
+        domain: 'www.codebuddy.cn',
+        uid: 'pool-uid',
+        source: 'pool',
+        region: 'cn',
+      })
+      await store.poolFor('cn').select(undefined)
+      expect((await store.cn.current())?.accessToken).toBe('desktop-token')
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('flash probe parsing', () => {
+  it('reads the upstream reset time instead of guessing from credits', () => {
+    const message = '{"code":6004,"msg":"当前模型请求过于频繁，将在 2026-10-26 21:44:41 恢复"}'
+    expect(parseBusinessCode(message)).toBe('6004')
+    const reset = parseResetTime(message)
+    expect(reset).toBe(Date.parse('2026-10-26T21:44:41+08:00'))
+  })
+
+  it('returns no reset time when the gateway does not state one', () => {
+    expect(parseResetTime('{"code":11140,"msg":"账号已被封禁"}')).toBeUndefined()
+    expect(parseBusinessCode('no code here')).toBeUndefined()
+  })
+})
+
+describe('account route', () => {
+  it('never returns a full uid to the browser', () => {
+    expect(maskUid('3ac06abe-657f-44f3-81a0-2bd25f3567d7')).toBe('3ac0…67d7')
+    expect(displayNameFor({ uid: 'x', nickname: '173****0329' })).toBe('173****0329')
+    // A user label wins over the nickname, because it is what the user chose.
+    expect(displayNameFor({ uid: 'x', nickname: '173****0329', label: '主力号' })).toBe('主力号')
+    // A short uid is shown as-is; masking it would hide the whole value.
+    expect(displayNameFor({ uid: 'short' })).toBe('short')
+  })
+
+  it('validates every mutation payload', () => {
+    expect(parseAccountAction({ action: 'select', region: 'cn', uid: 'u1' })).toEqual({ action: 'select', region: 'cn', uid: 'u1' })
+    expect(parseAccountAction({ action: 'select', region: 'cn', uid: null })).toEqual({ action: 'select', region: 'cn', uid: null })
+    expect(parseAccountAction({ action: 'probe', region: 'global' })).toEqual({ action: 'probe', region: 'global' })
+    expect(() => parseAccountAction({ action: 'select', region: 'mars', uid: 'u1' })).toThrow(/region/)
+    expect(() => parseAccountAction({ action: 'explode', region: 'cn' })).toThrow(/unknown action/)
+    expect(() => parseAccountAction({ action: 'remove', region: 'cn' })).toThrow(/uid/)
+  })
+
+  it('forgets a rate-limit verdict once its own reset time passes', async () => {
+    const fs = await import('node:fs/promises')
+    const os = await import('node:os')
+    const path = await import('node:path')
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'workbuddy-expiry-'))
+    try {
+      const store = new WorkBuddyDualCredentialStore({
+        refreshCN: async () => ({ accessToken: 'x' }),
+        refreshGlobal: async () => ({ accessToken: 'x' }),
+        // Point both fallbacks at a file that does not exist: the suite must
+        // never spend the developer's real sign-ins.
+        cnPathOverride: path.join(dir, 'no-cn.info'),
+        globalPathOverride: path.join(dir, 'no-global.info'),
+        poolPaths: { cn: path.join(dir, 'cn.json'), global: path.join(dir, 'global.json') },
+      })
+      await store.poolFor('cn').upsert({
+        accessToken: 'a',
+        refreshToken: 'r',
+        expiresAtMs: Date.now() + 3_600_000,
+        domain: 'www.codebuddy.cn',
+        uid: 'u1',
+        source: 'pool',
+        region: 'cn',
+      })
+
+      let probes = 0
+      let resetsAtMs = Date.now() - 60_000
+      const fakeClient = {
+        async fetchCredits() {
+          return { accounts: [], totalBalance: 10 }
+        },
+        async probeModel() {
+          probes++
+          return { verdict: 'rate-limited' as const, code: '6004', resetsAtMs, elapsedMs: 1, checkedAt: Date.now() }
+        },
+      }
+      const { workBuddyAccountsView, createAccountRouteState } = await import('../src/account-route.ts')
+      const state = createAccountRouteState()
+      await workBuddyAccountsView({ store, client: fakeClient as never }, state)
+      expect(probes).toBe(1)
+
+      // The cached verdict expired with the upstream's reset time, so the
+      // next view re-checks instead of repeating a dead answer.
+      resetsAtMs = Date.now() + 3_600_000
+      const view = await workBuddyAccountsView({ store, client: fakeClient as never }, state)
+      expect(probes).toBe(2)
+      expect(view.cn.accounts[0]?.probe?.resetsAtMs).toBe(resetsAtMs)
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('serves the pool, probes the flash model, and stops on untrusted hosts', async () => {
+    const fs = await import('node:fs/promises')
+    const os = await import('node:os')
+    const path = await import('node:path')
+    const http = await import('node:http')
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'workbuddy-route-'))
+    const server = http.createServer()
+    try {
+      const store = new WorkBuddyDualCredentialStore({
+        refreshCN: async () => ({ accessToken: 'x' }),
+        refreshGlobal: async () => ({ accessToken: 'x' }),
+        cnPathOverride: path.join(dir, 'no-cn.info'),
+        globalPathOverride: path.join(dir, 'no-global.info'),
+        poolPaths: { cn: path.join(dir, 'cn.json'), global: path.join(dir, 'global.json') },
+      })
+      await store.poolFor('cn').upsert({
+        accessToken: 'a',
+        refreshToken: 'r',
+        expiresAtMs: Date.now() + 3_600_000,
+        domain: 'www.codebuddy.cn',
+        uid: '3ac06abe-657f-44f3-81a0-2bd25f3567d7',
+        nickname: '173****0329',
+        source: 'pool',
+        region: 'cn',
+      })
+
+      let probes = 0
+      // A future reset keeps the cached verdict fresh for the assertions below.
+      const resetsAtMs = Date.now() + 3_600_000
+      const fakeClient = {
+        async fetchCredits() {
+          return { accounts: [], totalBalance: 1706 }
+        },
+        async probeModel(_credential: unknown, model: string) {
+          probes++
+          return {
+            verdict: 'rate-limited' as const,
+            code: '6004',
+            resetsAtMs,
+            elapsedMs: 5,
+            checkedAt: Date.now(),
+          }
+        },
+      }
+
+      server.on('request', workBuddyAccountHandler({
+        store,
+        client: fakeClient as never,
+      }, createAccountRouteState()))
+      await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+      const address = server.address() as { port: number }
+      const base = `http://127.0.0.1:${address.port}`
+
+      const get = await fetch(base, { headers: { host: `127.0.0.1:${address.port}` } })
+      expect(get.status).toBe(200)
+      const view = (await get.json()) as { cn: { accounts: { uid: string; displayName: string; active: boolean; probe?: unknown }[]; usingFallback: boolean } }
+      expect(view.cn.usingFallback).toBe(false)
+      expect(view.cn.accounts[0]?.displayName).toBe('173****0329')
+      expect(view.cn.accounts[0]?.active).toBe(true)
+      expect(view.cn.accounts[0]?.uid).toBe('3ac06abe-657f-44f3-81a0-2bd25f3567d7')
+
+      const probe = await fetch(base, {
+        method: 'POST',
+        headers: { host: `127.0.0.1:${address.port}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ action: 'probe', region: 'cn' }),
+      })
+      expect(probe.status).toBe(200)
+      const probed = (await probe.json()) as { cn: { accounts: { probe?: { verdict: string; resetsAtMs?: number } }[] } }
+      expect(probed.cn.accounts[0]?.probe?.verdict).toBe('rate-limited')
+      expect(probed.cn.accounts[0]?.probe?.resetsAtMs).toBe(resetsAtMs)
+      // The first view checks each account once, so the panel opens with real
+      // verdicts; the explicit probe adds one more.
+      expect(probes).toBe(2)
+
+      // Within the cache window a re-open must not spend another request.
+      const second = await fetch(base, { headers: { host: `127.0.0.1:${address.port}` } })
+      expect(second.status).toBe(200)
+      await second.json()
+      expect(probes).toBe(2)
+
+      // A non-loopback Host header must not reach the account list.
+      // `fetch` refuses to override Host, so this goes through http directly.
+      const foreignStatus = await new Promise<number>((resolve, reject) => {
+        const request = http.request({
+          host: '127.0.0.1',
+          port: address.port,
+          path: '/',
+          headers: { host: 'example.com' },
+        }, response => {
+          response.resume()
+          resolve(response.statusCode ?? 0)
+        })
+        request.on('error', reject)
+        request.end()
+      })
+      expect(foreignStatus).toBe(403)
+    } finally {
+      await new Promise<void>(resolve => server.close(() => resolve()))
       await fs.rm(dir, { recursive: true, force: true })
     }
   })

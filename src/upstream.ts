@@ -6,6 +6,8 @@ import type {
   WorkBuddyCredential,
   WorkBuddyCredits,
   WorkBuddyModelInfo,
+  WorkBuddyProbeResult,
+  WorkBuddyProbeVerdict,
   WorkBuddyRegion,
 } from './types.ts'
 import type { WorkBuddyRefreshOutcome } from './auth.ts'
@@ -33,6 +35,13 @@ const CLI_VERSION = { cn: '2.63.2', global: '2.115.0' } as const
 const JSON_TIMEOUT_MS = 30_000
 const ERROR_BODY_LIMIT = 4096
 
+/** A probe asks for one token, so a healthy answer costs a fraction of a credit. */
+const PROBE_TIMEOUT_MS = 45_000
+const PROBE_MAX_TOKENS = 1
+
+/** Gateway codes that mean "this account cannot run this model right now". */
+const PROBE_BLOCK_CODES = ['6004', '11140', '14018'] as const
+
 const HARD_CREDIT_MARKERS = [
   'insufficient credit', 'no credit', 'credit exhausted', 'out of credit',
   'quota exceeded', 'quota exhaust', 'payment required', 'credit not enough',
@@ -47,6 +56,46 @@ function classifyUpstreamError(status: number, body: string): UpstreamErrorKind 
   if (status === 404) return 'not_found'
   if (status >= 500) return 'server'
   return 'client'
+}
+
+/**
+ * The gateway answers a rate-limited stream with an SSE frame carrying the
+ * business code and, for 6004, the exact moment the model frees up. Reading
+ * that timestamp beats estimating from credits: it is the upstream's own
+ * schedule.
+ */
+export function parseResetTime(text: string): number | undefined {
+  const match = /将在\s*(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})/.exec(text)
+  if (match === null) return undefined
+  const [, day, clock] = match
+  // The gateway states the reset in the account's own zone; CN and Global
+  // share +08:00 in practice, and a wrong zone only shifts the displayed time.
+  const parsed = Date.parse(`${day}T${clock}+08:00`)
+  return Number.isFinite(parsed) ? parsed : undefined
+}
+
+/** First gateway business code in a body or SSE frame. */
+export function parseBusinessCode(text: string): string | undefined {
+  const match = /"code"\s*:\s*(\d+)/.exec(text)
+  return match?.[1]
+}
+
+function probeVerdictFor(status: number, code: string | undefined): WorkBuddyProbeVerdict {
+  if (code === '6004') return 'rate-limited'
+  if (code === '11140') return 'banned'
+  if (code === '14018') return 'no-credit'
+  if (status === 429) return 'rate-limited'
+  if (status === 401 || status === 403) return 'auth'
+  return 'error'
+}
+
+/** Strip anything token-shaped before a message reaches the panel. */
+function probeDetail(text: string): string | undefined {
+  const cleaned = text
+    .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/gu, '[redacted]')
+    .replace(/\s+/gu, ' ')
+    .trim()
+  return cleaned === '' ? undefined : cleaned.slice(0, 200)
 }
 
 function chatBase(region: WorkBuddyRegion): string {
@@ -268,6 +317,89 @@ export class WorkBuddyUpstreamClient {
       kind: classifyUpstreamError(response.status, text),
       message: text,
     }
+  }
+
+  /**
+   * Ask the gateway whether `model` runs on this account right now.
+   *
+   * This sends a real, one-token streaming request instead of reading credits:
+   * a rate limit is per model, so the balance says nothing about whether
+   * flash is available. Streaming is required — the CN gateway rejects
+   * non-stream requests for these models with 11101.
+   *
+   * The first SSE frame already carries the verdict, so the body is cancelled
+   * immediately: a blocked account streams one error frame and a healthy one
+   * streams its first delta, and neither needs the rest.
+   */
+  async probeModel(
+    credential: WorkBuddyCredential,
+    model: string,
+  ): Promise<WorkBuddyProbeResult> {
+    const startedAt = Date.now()
+    const body = JSON.stringify({
+      model,
+      // The Global gateway rejects a conversation that does not open with a
+      // system message (code 11128), so the probe always sends one. CN accepts
+      // it too, which keeps both lanes on one shape.
+      messages: [
+        { role: 'system', content: 'You are a helpful assistant.' },
+        { role: 'user', content: 'ok' },
+      ],
+      max_tokens: PROBE_MAX_TOKENS,
+      stream: true,
+    })
+    const checkedAt = startedAt
+    const finish = (
+      verdict: WorkBuddyProbeVerdict,
+      extra: { code?: string | undefined; head?: string | undefined } = {},
+    ): WorkBuddyProbeResult => ({
+      verdict,
+      ...(extra.code === undefined ? {} : { code: extra.code }),
+      ...(extra.head === undefined ? {} : { detail: probeDetail(extra.head) }),
+      ...(extra.head === undefined ? {} : { resetsAtMs: parseResetTime(extra.head) }),
+      elapsedMs: Date.now() - startedAt,
+      checkedAt,
+    })
+
+    let response: Response
+    try {
+      response = await fetch(`${chatBase(credential.region)}/v2/chat/completions`, {
+        method: 'POST',
+        headers: {
+          ...chatHeaders(credential),
+          'Authorization': `Bearer ${credential.accessToken}`,
+        },
+        body,
+        signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
+      })
+    } catch (error: unknown) {
+      return finish('error', { head: `transport error: ${String(error)}` })
+    }
+
+    if (!response.ok) {
+      const text = (await response.text().catch(() => '')).slice(0, ERROR_BODY_LIMIT)
+      const code = parseBusinessCode(text)
+      return finish(probeVerdictFor(response.status, code), { code, head: text })
+    }
+
+    let head = ''
+    try {
+      const reader = response.body?.getReader()
+      if (reader === undefined) return finish('ok')
+      const { value } = await reader.read()
+      head = Buffer.from(value ?? []).toString('utf8')
+      await reader.cancel().catch(() => {})
+    } catch {
+      // A body that never produced a frame still means the request was
+      // accepted; treat it as usable rather than inventing a failure.
+      return finish('ok')
+    }
+
+    const code = parseBusinessCode(head)
+    if (code !== undefined && (PROBE_BLOCK_CODES as readonly string[]).includes(code)) {
+      return finish(probeVerdictFor(response.status, code), { code, head })
+    }
+    return finish('ok')
   }
 
   async refreshToken(credential: WorkBuddyCredential): Promise<WorkBuddyRefreshOutcome> {

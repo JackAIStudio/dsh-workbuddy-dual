@@ -1,5 +1,6 @@
 import z from "@deepseek-ai/schemastery";
 import "@earendil-works/pi-ai";
+import "@deepseek-ai/dsh-llm";
 import { PiAiAdapter } from "@deepseek-ai/dsh-llm-pi-ai";
 import { Context } from "@deepseek-ai/cordis";
 import { AttachmentStore } from "@deepseek-ai/dsh-attachment";
@@ -14,7 +15,11 @@ interface WorkBuddyCredential {
   uid: string;
   enterpriseId?: string | undefined;
   nickname?: string | undefined;
-  source: 'desktop' | 'dsh';
+  /**
+   * Where this credential came from. `pool` means it is one entry of the
+   * plugin's own account list, which the user picks from in the settings card.
+   */
+  source: 'desktop' | 'dsh' | 'pool';
   region: WorkBuddyRegion;
 }
 type WorkBuddyAuthStatus = {
@@ -27,7 +32,7 @@ type WorkBuddyAuthStatus = {
   refreshExpiresAtMs?: number | undefined;
   nickname?: string | undefined;
   domain?: string | undefined;
-  source: 'desktop' | 'dsh';
+  source: 'desktop' | 'dsh' | 'pool';
 };
 interface WorkBuddyCreditAccount {
   name: string;
@@ -59,6 +64,24 @@ interface WorkBuddyModelInfo {
   reasoning?: WorkBuddyModelReasoning | undefined;
   billing?: WorkBuddyModelBilling | undefined;
   region: WorkBuddyRegion;
+}
+/**
+ * Result of asking the upstream whether one model can run *right now* on one
+ * account. `ok` means a real (one-token) request was accepted; the other
+ * verdicts are the exact reasons it was not.
+ */
+type WorkBuddyProbeVerdict = 'ok' | 'rate-limited' | 'banned' | 'no-credit' | 'auth' | 'error';
+interface WorkBuddyProbeResult {
+  verdict: WorkBuddyProbeVerdict;
+  /** Upstream business code when the gateway supplied one (6004, 11140, …). */
+  code?: string | undefined;
+  /** When a rate limit lifts, in epoch milliseconds; parsed from the message. */
+  resetsAtMs?: number | undefined;
+  /** Short, token-free explanation for the panel. */
+  detail?: string | undefined;
+  /** How long the probe took. */
+  elapsedMs: number;
+  checkedAt: number;
 }
 //#endregion
 //#region src/model-paths.d.ts
@@ -99,6 +122,77 @@ declare class WorkBuddyDualCatalog {
   setModels(region: WorkBuddyRegion, models: readonly WorkBuddyModelInfo[]): void;
 }
 //#endregion
+//#region src/accounts.d.ts
+/** One stored sign-in. Tokens are refreshed in place. */
+interface WorkBuddyPoolAccount {
+  /** Stable identity: the WorkBuddy uid. */
+  uid: string;
+  region: WorkBuddyRegion;
+  nickname?: string | undefined;
+  /** User-supplied label; shown instead of the nickname when present. */
+  label?: string | undefined;
+  accessToken: string;
+  refreshToken: string;
+  expiresAtMs: number;
+  refreshExpiresAtMs?: number | undefined;
+  domain: string;
+  enterpriseId?: string | undefined;
+  /** First time the pool saw this account. */
+  addedAt: number;
+  /** Last successful token write. */
+  updatedAt: number;
+}
+/** Versioned on-disk shape of one region's pool. */
+interface WorkBuddyPoolDocument {
+  version: 1;
+  region: WorkBuddyRegion;
+  accounts: readonly WorkBuddyPoolAccount[];
+  /** `uid` of the account in use; undefined means "fall back to the desktop app". */
+  activeUid?: string | undefined;
+  updatedAt: number;
+}
+/** Reads and writes one region's pool with atomic replacement. */
+declare class WorkBuddyAccountPool {
+  readonly region: WorkBuddyRegion;
+  private readonly path;
+  private cached;
+  /** Modification time of the document the cache was read from. */
+  private cachedMtimeMs;
+  constructor(region: WorkBuddyRegion, options?: {
+    path?: string | undefined;
+  });
+  /** Absolute document path; surfaced by diagnostics only. */
+  get documentPath(): string;
+  get(): Promise<WorkBuddyPoolDocument>;
+  /** Re-read from disk on the next `get`; used when another host may have written. */
+  invalidate(): void;
+  /** The account the user selected, if the pool still holds it. */
+  active(): Promise<WorkBuddyPoolAccount | undefined>;
+  find(uid: string): Promise<WorkBuddyPoolAccount | undefined>;
+  /** Persist a whole document after normalizing it against the region. */
+  replace(doc: WorkBuddyPoolDocument): Promise<WorkBuddyPoolDocument>;
+  /**
+   * Add or replace one account, keeping its `addedAt` and label.
+   *
+   * Adding through the panel is also how an account becomes selectable, so a
+   * first-time add selects it; re-capturing an existing account never steals
+   * the selection from whatever the user already chose.
+   */
+  upsert(credential: WorkBuddyCredential, options?: {
+    select?: boolean | undefined;
+    label?: string | undefined;
+  }): Promise<WorkBuddyPoolDocument>;
+  /** Store a refreshed token pair for one account. */
+  update(uid: string, credential: WorkBuddyCredential): Promise<WorkBuddyPoolDocument | undefined>;
+  /** Rename an account (label only; identity stays the uid). */
+  relabel(uid: string, label: string): Promise<WorkBuddyPoolDocument | undefined>;
+  remove(uid: string): Promise<WorkBuddyPoolDocument>;
+  /** Select an existing account; `undefined` returns to the desktop app's sign-in. */
+  select(uid: string | undefined): Promise<WorkBuddyPoolDocument>;
+  /** Drop the whole document, including every stored token. */
+  clear(): Promise<void>;
+}
+//#endregion
 //#region src/auth.d.ts
 interface WorkBuddyRefreshOutcome {
   accessToken: string;
@@ -110,6 +204,12 @@ interface RegionStoreOptions {
   region: WorkBuddyRegion;
   desktopPathOverride?: string | undefined;
   ownPath?: string | undefined;
+  /**
+   * The user's account list. When it holds a selected account, that account
+   * wins over both the desktop app's sign-in and the plugin's own cache: the
+   * selection is an explicit instruction, not a tiebreak.
+   */
+  pool?: WorkBuddyAccountPool | undefined;
   refresh: (credential: WorkBuddyCredential) => Promise<WorkBuddyRefreshOutcome>;
   refreshMarginMs?: number | undefined;
 }
@@ -119,8 +219,11 @@ declare class RegionCredentialStore {
   private readonly ownPath;
   private readonly refresh;
   private readonly refreshMarginMs;
+  private readonly poolRef;
   private inflight?;
   constructor(options: RegionStoreOptions);
+  /** The pool, when this store was built with one. */
+  get pool(): WorkBuddyAccountPool | undefined;
   setDesktopPath(path: string | undefined): void;
   resolveDesktopCandidates(): string[];
   desktopFilePresent(): Promise<boolean>;
@@ -129,6 +232,14 @@ declare class RegionCredentialStore {
   private saveOwn;
   logout(): Promise<void>;
   current(): Promise<WorkBuddyCredential | undefined>;
+  /**
+   * The sign-in the plugin would use with no pool selection: the desktop
+   * app's credential, or this plugin's own refreshed copy of it.
+   *
+   * Kept separate from `current()` so the panel can describe the fallback row
+   * honestly while a pooled account is in use.
+   */
+  fallback(): Promise<WorkBuddyCredential | undefined>;
   private needsRefresh;
   resolve(): Promise<WorkBuddyCredential>;
   private refreshNow;
@@ -137,13 +248,17 @@ declare class RegionCredentialStore {
 declare class WorkBuddyDualCredentialStore {
   readonly cn: RegionCredentialStore;
   readonly global: RegionCredentialStore;
+  readonly pools: Record<WorkBuddyRegion, WorkBuddyAccountPool>;
   constructor(options: {
     refreshCN: (credential: WorkBuddyCredential) => Promise<WorkBuddyRefreshOutcome>;
     refreshGlobal: (credential: WorkBuddyCredential) => Promise<WorkBuddyRefreshOutcome>;
     cnPathOverride?: string | undefined;
     globalPathOverride?: string | undefined;
+    /** Pool document paths; tests point these at a temp directory. */
+    poolPaths?: Partial<Record<WorkBuddyRegion, string>> | undefined;
   });
   storeFor(region: WorkBuddyRegion): RegionCredentialStore;
+  poolFor(region: WorkBuddyRegion): WorkBuddyAccountPool;
 }
 //#endregion
 //#region src/upstream.d.ts
@@ -159,6 +274,19 @@ type WorkBuddyChatResult = {
 };
 declare class WorkBuddyUpstreamClient {
   chatStream(credential: WorkBuddyCredential, bodyJson: string, signal?: AbortSignal): Promise<WorkBuddyChatResult>;
+  /**
+   * Ask the gateway whether `model` runs on this account right now.
+   *
+   * This sends a real, one-token streaming request instead of reading credits:
+   * a rate limit is per model, so the balance says nothing about whether
+   * flash is available. Streaming is required — the CN gateway rejects
+   * non-stream requests for these models with 11101.
+   *
+   * The first SSE frame already carries the verdict, so the body is cancelled
+   * immediately: a blocked account streams one error frame and a healthy one
+   * streams its first delta, and neither needs the rest.
+   */
+  probeModel(credential: WorkBuddyCredential, model: string): Promise<WorkBuddyProbeResult>;
   refreshToken(credential: WorkBuddyCredential): Promise<WorkBuddyRefreshOutcome>;
   fetchModels(credential: WorkBuddyCredential): Promise<readonly WorkBuddyModelInfo[]>;
   fetchCredits(credential: WorkBuddyCredential): Promise<WorkBuddyCredits>;

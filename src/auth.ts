@@ -14,6 +14,7 @@ import { basename, join } from 'node:path'
 import { withFileLock, writeFileAtomic } from '@deepseek-ai/dsh-atomic-write'
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
 import { decryptWbString } from './decrypt.ts'
+import { WorkBuddyAccountPool, toCredential } from './accounts.ts'
 import type { WorkBuddyAuthStatus, WorkBuddyCredential, WorkBuddyRegion } from './types.ts'
 
 export interface WorkBuddyRefreshOutcome {
@@ -27,6 +28,12 @@ export interface RegionStoreOptions {
   region: WorkBuddyRegion
   desktopPathOverride?: string | undefined
   ownPath?: string | undefined
+  /**
+   * The user's account list. When it holds a selected account, that account
+   * wins over both the desktop app's sign-in and the plugin's own cache: the
+   * selection is an explicit instruction, not a tiebreak.
+   */
+  pool?: WorkBuddyAccountPool | undefined
   refresh: (credential: WorkBuddyCredential) => Promise<WorkBuddyRefreshOutcome>
   refreshMarginMs?: number | undefined
 }
@@ -163,6 +170,7 @@ export class RegionCredentialStore {
   private readonly ownPath: string
   private readonly refresh: RegionStoreOptions['refresh']
   private readonly refreshMarginMs: number
+  private readonly poolRef: WorkBuddyAccountPool | undefined
   private inflight?: Promise<WorkBuddyCredential> | undefined
 
   constructor(options: RegionStoreOptions) {
@@ -171,6 +179,12 @@ export class RegionCredentialStore {
     this.ownPath = options.ownPath ?? join(resolveDshHome(), this.region === 'cn' ? OWN_CN_FILENAME : OWN_GLOBAL_FILENAME)
     this.refresh = options.refresh
     this.refreshMarginMs = options.refreshMarginMs ?? 300_000
+    this.poolRef = options.pool
+  }
+
+  /** The pool, when this store was built with one. */
+  get pool(): WorkBuddyAccountPool | undefined {
+    return this.poolRef
   }
 
   setDesktopPath(path: string | undefined): void {
@@ -234,6 +248,19 @@ export class RegionCredentialStore {
   }
 
   async current(): Promise<WorkBuddyCredential | undefined> {
+    const pooled = await this.poolRef?.active()
+    if (pooled !== undefined) return toCredential(pooled)
+    return await this.fallback()
+  }
+
+  /**
+   * The sign-in the plugin would use with no pool selection: the desktop
+   * app's credential, or this plugin's own refreshed copy of it.
+   *
+   * Kept separate from `current()` so the panel can describe the fallback row
+   * honestly while a pooled account is in use.
+   */
+  async fallback(): Promise<WorkBuddyCredential | undefined> {
     const [desktop, own] = await Promise.all([this.readDesktop(), this.readOwn()])
     if (desktop === undefined) return own
     if (own === undefined) return desktop
@@ -270,9 +297,16 @@ export class RegionCredentialStore {
         ...(outcome.refreshToken === undefined ? {} : { refreshToken: outcome.refreshToken }),
         expiresAtMs: outcome.expiresInSec !== undefined ? Date.now() + outcome.expiresInSec * 1000 : credential.expiresAtMs,
         ...(outcome.domain === undefined || outcome.domain === '' ? {} : { domain: outcome.domain }),
-        source: 'dsh',
+        source: credential.source === 'pool' ? 'pool' : 'dsh',
       }
-      await this.saveOwn(refreshed)
+      // A pooled account's new tokens belong back in the pool entry, not in
+      // the single-credential cache, or the selector would keep offering the
+      // stale copy.
+      if (credential.source === 'pool') {
+        await this.poolRef?.update(credential.uid, refreshed)
+      } else {
+        await this.saveOwn(refreshed)
+      }
       return refreshed
     } catch (err) {
       if (credential.expiresAtMs > Date.now() + 30_000) return credential
@@ -302,26 +336,39 @@ export class RegionCredentialStore {
 export class WorkBuddyDualCredentialStore {
   readonly cn: RegionCredentialStore
   readonly global: RegionCredentialStore
+  readonly pools: Record<WorkBuddyRegion, WorkBuddyAccountPool>
 
   constructor(options: {
     refreshCN: (credential: WorkBuddyCredential) => Promise<WorkBuddyRefreshOutcome>
     refreshGlobal: (credential: WorkBuddyCredential) => Promise<WorkBuddyRefreshOutcome>
     cnPathOverride?: string | undefined
     globalPathOverride?: string | undefined
+    /** Pool document paths; tests point these at a temp directory. */
+    poolPaths?: Partial<Record<WorkBuddyRegion, string>> | undefined
   }) {
+    this.pools = {
+      cn: new WorkBuddyAccountPool('cn', { path: options.poolPaths?.cn }),
+      global: new WorkBuddyAccountPool('global', { path: options.poolPaths?.global }),
+    }
     this.cn = new RegionCredentialStore({
       region: 'cn',
       desktopPathOverride: options.cnPathOverride,
+      pool: this.pools.cn,
       refresh: options.refreshCN,
     })
     this.global = new RegionCredentialStore({
       region: 'global',
       desktopPathOverride: options.globalPathOverride,
+      pool: this.pools.global,
       refresh: options.refreshGlobal,
     })
   }
 
   storeFor(region: WorkBuddyRegion): RegionCredentialStore {
     return region === 'cn' ? this.cn : this.global
+  }
+
+  poolFor(region: WorkBuddyRegion): WorkBuddyAccountPool {
+    return region === 'cn' ? this.pools.cn : this.pools.global
   }
 }

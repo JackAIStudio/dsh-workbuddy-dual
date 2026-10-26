@@ -9,7 +9,11 @@ export interface WorkBuddyCredential {
   uid: string
   enterpriseId?: string | undefined
   nickname?: string | undefined
-  source: 'desktop' | 'dsh'
+  /**
+   * Where this credential came from. `pool` means it is one entry of the
+   * plugin's own account list, which the user picks from in the settings card.
+   */
+  source: 'desktop' | 'dsh' | 'pool'
   region: WorkBuddyRegion
 }
 
@@ -22,7 +26,7 @@ export type WorkBuddyAuthStatus =
       refreshExpiresAtMs?: number | undefined
       nickname?: string | undefined
       domain?: string | undefined
-      source: 'desktop' | 'dsh'
+      source: 'desktop' | 'dsh' | 'pool'
     }
 
 export interface WorkBuddyCreditAccount {
@@ -69,4 +73,24 @@ export interface WorkBuddyModelInfo {
 export interface WorkBuddyDualModelCatalog {
   cn: readonly WorkBuddyModelInfo[]
   global: readonly WorkBuddyModelInfo[]
+}
+
+/**
+ * Result of asking the upstream whether one model can run *right now* on one
+ * account. `ok` means a real (one-token) request was accepted; the other
+ * verdicts are the exact reasons it was not.
+ */
+export type WorkBuddyProbeVerdict = 'ok' | 'rate-limited' | 'banned' | 'no-credit' | 'auth' | 'error'
+
+export interface WorkBuddyProbeResult {
+  verdict: WorkBuddyProbeVerdict
+  /** Upstream business code when the gateway supplied one (6004, 11140, …). */
+  code?: string | undefined
+  /** When a rate limit lifts, in epoch milliseconds; parsed from the message. */
+  resetsAtMs?: number | undefined
+  /** Short, token-free explanation for the panel. */
+  detail?: string | undefined
+  /** How long the probe took. */
+  elapsedMs: number
+  checkedAt: number
 }
