@@ -56,11 +56,29 @@ function writeJson(res: ServerResponse, status: number, body: unknown): void {
   res.end(json)
 }
 
+/**
+ * The OpenAI error `type` that describes this failure, so the caller's retry
+ * policy can classify it.
+ *
+ * `type` is not decoration: the harness reads it before the message, and only
+ * retries the codes it derives from a server or transport failure. Labelling
+ * every shim error `invalid_request_error` turned a dropped gateway connection
+ * into "bad request", which the retry policy treats as permanent — a long turn
+ * died on one transient socket failure while the session was still healthy.
+ */
+function errorTypeFor(status: number, code: string): string {
+  if (code === 'transport' || code === 'server' || code === 'upstream_error') return 'server_error'
+  if (status >= 500) return 'server_error'
+  if (status === 401 || status === 403) return 'authentication_error'
+  if (status === 429) return 'rate_limit_error'
+  return 'invalid_request_error'
+}
+
 function writeOpenAIError(res: ServerResponse, status: number, code: string, message: string): void {
   writeJson(res, status, {
     error: {
       message,
-      type: 'invalid_request_error',
+      type: errorTypeFor(status, code),
       code,
     },
   })
