@@ -23,7 +23,9 @@ import {
 import { createWorkBuddyDualShim } from './shim.ts'
 import { WorkBuddyUpstreamClient } from './upstream.ts'
 import { registerWorkBuddyDualStatusRoute } from './web-status.ts'
+import { registerWorkBuddyDualAccountRoutes } from './account-route.ts'
 import { clearHostHeartbeat, writeHostHeartbeat } from './host-heartbeat.ts'
+import type { WorkBuddyModelInfo } from './types.ts'
 
 export {
   WORKBUDDY_CN_PROVIDER,
@@ -35,6 +37,9 @@ export { WorkBuddyDualCatalog } from './catalog.ts'
 export { WorkBuddyUpstreamClient } from './upstream.ts'
 export { createWorkBuddyDualShim } from './shim.ts'
 export { WorkBuddyDualSelectionStore } from './selection-store.ts'
+export { WorkBuddyAccountPool, poolDocumentPath, toCredential } from './accounts.ts'
+export { WORKBUDDY_DUAL_ACCOUNTS_PATH, WORKBUDDY_FLASH_MODEL } from './account-paths.ts'
+export { createAccountRouteState, readAuthFile, workBuddyAccountsView } from './account-route.ts'
 export {
   defaultSelection,
   filterModels,
@@ -82,8 +87,42 @@ export function apply(ctx: Context, config: WorkBuddyDualConfig = {}): void {
     ctx.events.emit('llm/adapters-updated')
   }
 
+  /**
+   * Adopt a freshly fetched upstream catalog.
+   *
+   * `invalidate()` alone only rebuilds the adapter's provider profiles; the
+   * model picker keeps rendering the names it already loaded until it hears
+   * `llm/adapters-updated`. Without the event a startup fetch that lands after
+   * the first picker read leaves the fallback credits (and badges) on screen
+   * for the rest of the session, even though every later request is billed at
+   * the live rate.
+   */
+  const adoptCatalog = (region: 'cn' | 'global', models: readonly WorkBuddyModelInfo[]): void => {
+    if (models.length === 0) return
+    catalog.setModels(region, models)
+    invalidate?.()
+    ctx.events.emit('llm/adapters-updated')
+  }
+
   ctx.inject(['webServer'], webCtx => {
     registerWorkBuddyDualStatusRoute(webCtx, { store, client, catalog })
+    registerWorkBuddyDualAccountRoutes(webCtx, {
+      store,
+      client,
+      async onAccountChange(region) {
+        // A different account can carry a different model catalog (an
+        // enterprise sign-in may expose models a personal one does not), so
+        // re-read the catalog and let every picker refresh.
+        try {
+          const credential = await store.storeFor(region).current()
+          if (credential === undefined) return
+          const models = await client.fetchModels(credential)
+          adoptCatalog(region, models)
+        } catch (error: unknown) {
+          ctx.logger.warn(`dsh-workbuddy-dual: could not refresh the ${region} catalog after switching accounts`, error)
+        }
+      },
+    })
     registerWorkBuddyDualModelRoutes(webCtx, {
       catalog,
       selection,
@@ -180,10 +219,7 @@ export function apply(ctx: Context, config: WorkBuddyDualConfig = {}): void {
           const cnCred = await store.cn.current()
           if (cnCred) {
             const models = await client.fetchModels(cnCred)
-            if (models.length > 0) {
-              catalog.setModels('cn', models)
-              invalidate?.()
-            }
+            adoptCatalog('cn', models)
           }
         } catch (err) {
           ctx.logger.warn('dsh-workbuddy-dual: failed to fetch dynamic CN models; fallback active', err)
@@ -194,10 +230,7 @@ export function apply(ctx: Context, config: WorkBuddyDualConfig = {}): void {
           const globalCred = await store.global.current()
           if (globalCred) {
             const models = await client.fetchModels(globalCred)
-            if (models.length > 0) {
-              catalog.setModels('global', models)
-              invalidate?.()
-            }
+            adoptCatalog('global', models)
           }
         } catch (err) {
           ctx.logger.warn('dsh-workbuddy-dual: failed to fetch dynamic Global models; fallback active', err)

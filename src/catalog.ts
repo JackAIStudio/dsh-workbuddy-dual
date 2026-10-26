@@ -5,6 +5,16 @@
 import type { WorkBuddyModelInfo, WorkBuddyRegion } from './types.ts'
 import { filterModels, type WorkBuddyDualSelection } from './selection.ts'
 
+/**
+ * Placeholder catalog used only until the first `/v3/config` read lands.
+ *
+ * The upstream publishes credits as a multiplier and changes it without
+ * notice (DeepSeek-V4.1-Flash went 0.03 -> 0.11), so these numbers are a
+ * best-effort snapshot of the same values, kept in step with the gateway at
+ * the time of writing. Nothing here is authoritative: the picker replaces
+ * every entry with the live catalog as soon as it arrives, and billing always
+ * happens at the gateway's own rate.
+ */
 export const FALLBACK_CN_MODELS: readonly WorkBuddyModelInfo[] = [
   {
     id: 'deepseek-v4.1-flash',
@@ -13,7 +23,7 @@ export const FALLBACK_CN_MODELS: readonly WorkBuddyModelInfo[] = [
     maxTokens: 128_000,
     supportsImages: true,
     reasoning: { supports: true, onlyReasoning: true, supportedEfforts: ['low', 'medium', 'high', 'max'], defaultEffort: 'high', canDisableThinking: false },
-    billing: { credits: 'x0.03 credits', badges: ['独家优惠'], free: false },
+    billing: { credits: 'x0.11 credits', free: false },
     region: 'cn',
   },
   {

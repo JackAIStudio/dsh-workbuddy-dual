@@ -151,6 +151,10 @@ interface WorkBuddyPoolDocument {
   activeUid?: string | undefined;
   updatedAt: number;
 }
+/** Absolute path of one region's pool document. */
+declare function poolDocumentPath(region: WorkBuddyRegion): string;
+/** Turn a pool entry into the credential shape the shim already consumes. */
+declare function toCredential(account: WorkBuddyPoolAccount): WorkBuddyCredential;
 /** Reads and writes one region's pool with atomic replacement. */
 declare class WorkBuddyAccountPool {
   readonly region: WorkBuddyRegion;
@@ -359,6 +363,86 @@ declare class WorkBuddyDualSelectionStore {
   private load;
 }
 //#endregion
+//#region src/account-paths.d.ts
+declare const WORKBUDDY_DUAL_ACCOUNTS_PATH = "/plugins/dsh-workbuddy-dual/accounts";
+/**
+ * The model whose availability decides which account is worth using.
+ * It is the cheap flash tier, not the flagship: an account with thousands of
+ * credits is useless when this one is rate limited.
+ */
+declare const WORKBUDDY_FLASH_MODEL = "deepseek-v4.1-flash";
+/** Whether one account can run the flash model right now. */
+interface WorkBuddyWebProbe {
+  verdict: WorkBuddyProbeVerdict;
+  /** Model the verdict belongs to. */
+  model: string;
+  /** Epoch ms when a rate limit lifts. */
+  resetsAtMs?: number | undefined;
+  checkedAt: number;
+  detail?: string | undefined;
+}
+/** One row in the account list. */
+interface WorkBuddyWebAccount {
+  uid: string;
+  /** Masked identifier, e.g. `173****0329`; never the full uid. */
+  displayName: string;
+  nickname?: string | undefined;
+  label?: string | undefined;
+  /** True for the account the plugin currently uses. */
+  active: boolean;
+  /** True for the entry that is not in the pool (desktop sign-in / cache). */
+  fallback: boolean;
+  expiresAtMs?: number | undefined;
+  credits?: number | undefined;
+  creditsAt?: number | undefined;
+  probe?: WorkBuddyWebProbe | undefined;
+}
+/** One region's account list plus the state of its fallback credential. */
+interface WorkBuddyWebRegionAccounts {
+  region: WorkBuddyRegion;
+  /** The sign-in the plugin would use when no pool entry is selected. */
+  fallbackSignedIn: boolean;
+  fallbackName?: string | undefined;
+  fallbackSource?: 'desktop' | 'dsh' | 'pool' | undefined;
+  /** Credits of the fallback sign-in, when it could be read. */
+  fallbackCredits?: number | undefined;
+  /** Flash verdict for the fallback sign-in, when it has been checked. */
+  fallbackProbe?: WorkBuddyWebProbe | undefined;
+  /** True when the plugin ignores the pool and uses the fallback credential. */
+  usingFallback: boolean;
+  accounts: readonly WorkBuddyWebAccount[];
+  /** Model whose availability the rows report. */
+  probeModel: string;
+}
+interface WorkBuddyWebAccounts {
+  cn: WorkBuddyWebRegionAccounts;
+  global: WorkBuddyWebRegionAccounts;
+}
+//#endregion
+//#region src/account-route.d.ts
+interface WorkBuddyDualAccountRouteOptions {
+  store: WorkBuddyDualCredentialStore;
+  client: WorkBuddyUpstreamClient;
+  /** Rebuild catalogs and notify pickers after the active account changes. */
+  onAccountChange?: ((region: WorkBuddyRegion) => void | Promise<void>) | undefined;
+}
+interface CachedCredits {
+  total: number;
+  at: number;
+}
+interface CachedProbe {
+  probe: WorkBuddyWebProbe;
+  at: number;
+}
+/** Parse one auth document; `parseWorkBuddyAuth` owns the decryption rules. */
+declare function readAuthFile(path: string, region: WorkBuddyRegion): Promise<WorkBuddyCredential>;
+interface WorkBuddyAccountRouteState {
+  credits: Map<string, CachedCredits>;
+  probes: Map<string, CachedProbe>;
+}
+declare function createAccountRouteState(): WorkBuddyAccountRouteState;
+declare function workBuddyAccountsView(deps: WorkBuddyDualAccountRouteOptions, state: WorkBuddyAccountRouteState): Promise<WorkBuddyWebAccounts>;
+//#endregion
 //#region src/index.d.ts
 declare const WORKBUDDY_DUAL_SETTINGS_NS = "workbuddy-dual";
 interface WorkBuddyDualConfig {
@@ -370,4 +454,4 @@ declare const name = "dsh-workbuddy-dual";
 declare const inject: readonly ["llm"];
 declare function apply(ctx: Context, config?: WorkBuddyDualConfig): void;
 //#endregion
-export { Config, WORKBUDDY_CN_PROVIDER, WORKBUDDY_DUAL_SETTINGS_NS, WORKBUDDY_GLOBAL_PROVIDER, WorkBuddyDualCatalog, WorkBuddyDualConfig, WorkBuddyDualCredentialStore, type WorkBuddyDualSelection, WorkBuddyDualSelectionStore, WorkBuddyUpstreamClient, advertisedModelIds, apply, createWorkBuddyDualAdapter, createWorkBuddyDualShim, defaultSelection, filterModels, inject, name, normalizeLanePreference, normalizeSelection };
+export { Config, WORKBUDDY_CN_PROVIDER, WORKBUDDY_DUAL_ACCOUNTS_PATH, WORKBUDDY_DUAL_SETTINGS_NS, WORKBUDDY_FLASH_MODEL, WORKBUDDY_GLOBAL_PROVIDER, WorkBuddyAccountPool, WorkBuddyDualCatalog, WorkBuddyDualConfig, WorkBuddyDualCredentialStore, type WorkBuddyDualSelection, WorkBuddyDualSelectionStore, WorkBuddyUpstreamClient, advertisedModelIds, apply, createAccountRouteState, createWorkBuddyDualAdapter, createWorkBuddyDualShim, defaultSelection, filterModels, inject, name, normalizeLanePreference, normalizeSelection, poolDocumentPath, readAuthFile, toCredential, workBuddyAccountsView };
