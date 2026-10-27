@@ -110,25 +110,50 @@ function originReferer(region: WorkBuddyRegion): string {
   return region === 'global' ? GLOBAL_BASE : CN_BILLING_BASE
 }
 
-/** Read the installed WorkBuddy app version; the gateway checks this header. */
+/**
+ * Read the installed WorkBuddy app version; the gateway checks this header.
+ *
+ * Reading it spawns PlistBuddy synchronously, and every request built headers
+ * used to do that two or three times. A settings panel that checks seven
+ * accounts therefore blocked the whole host for dozens of subprocess spawns.
+ * The version only changes when the app is reinstalled, so one read per region
+ * per process is enough.
+ */
+const appVersionCache = new Map<WorkBuddyRegion, string>()
+
 function appVersion(region: WorkBuddyRegion): string {
+  const cached = appVersionCache.get(region)
+  if (cached !== undefined) return cached
+  let version: string = FALLBACK_APP_VERSION[region]
   const plist = APP_INFO_PLIST[region]
   if (existsSync(plist)) {
     try {
       const value = execFileSync('/usr/libexec/PlistBuddy', ['-c', 'Print :CFBundleShortVersionString', plist], {
         encoding: 'utf8', timeout: 2000, stdio: ['ignore', 'pipe', 'ignore'],
       }).trim()
-      if (value) return value
+      if (value) version = value
     } catch {}
   }
-  return FALLBACK_APP_VERSION[region]
+  appVersionCache.set(region, version)
+  return version
 }
 
+/** Drop the cached versions; tests use it to observe the first read. */
+export function resetAppVersionCacheForTesting(): void {
+  appVersionCache.clear()
+}
+
+const userAgentCache = new Map<WorkBuddyRegion, string>()
+
 function clientUserAgent(region: WorkBuddyRegion): string {
+  const cached = userAgentCache.get(region)
+  if (cached !== undefined) return cached
   const version = appVersion(region)
-  return region === 'global'
+  const agent = region === 'global'
     ? `WorkBuddy/${version} WorkBuddy/${version} CLI/${CLI_VERSION.global}`
     : `CLI/${CLI_VERSION.cn} CodeBuddy/${CLI_VERSION.cn}`
+  userAgentCache.set(region, agent)
+  return agent
 }
 
 /** The official gateway's trace triplet shares one trace id. */

@@ -188,14 +188,87 @@ async function usableCredential(
 export interface WorkBuddyAccountRouteState {
   credits: Map<string, CachedCredits>
   probes: Map<string, CachedProbe>
+  /** One in-flight background refresh per lane, so polling cannot stack them. */
+  refreshing: Map<WorkBuddyRegion, Promise<void>>
+  /** Lanes asked to refresh again as soon as the current pass finishes. */
+  queued: Set<WorkBuddyRegion>
+  /** Epoch ms of the last failure per cache key, so a dead token backs off. */
+  failures: Map<string, number>
 }
 
 export function createAccountRouteState(): WorkBuddyAccountRouteState {
-  return { credits: new Map(), probes: new Map() }
+  return {
+    credits: new Map(),
+    probes: new Map(),
+    refreshing: new Map(),
+    queued: new Set(),
+    failures: new Map(),
+  }
 }
 
 function cacheKey(region: WorkBuddyRegion, uid: string, model?: string | undefined): string {
   return `${region}/${uid}${model === undefined ? '' : `/${model}`}`
+}
+
+/**
+ * How long a failed balance or probe is left alone.
+ *
+ * Without this, an expired token makes every poll retry forever: the failure
+ * never lands in the cache, so each refresh starts a fresh request and the
+ * panel's "still checking" state never ends.
+ */
+const FAILURE_BACKOFF_MS = 20_000
+
+function failedRecently(state: WorkBuddyAccountRouteState, key: string): boolean {
+  const at = state.failures.get(key)
+  if (at === undefined) return false
+  if (Date.now() - at < FAILURE_BACKOFF_MS) return true
+  state.failures.delete(key)
+  return false
+}
+
+/** What the panel can show right now, without touching the network. */
+function cachedCredits(
+  state: WorkBuddyAccountRouteState,
+  credential: WorkBuddyCredential,
+): number | undefined {
+  return state.credits.get(cacheKey(credential.region, credential.uid))?.total
+}
+
+/** Whether this sign-in still needs a network round trip. */
+function needsWork(state: WorkBuddyAccountRouteState, credential: WorkBuddyCredential): boolean {
+  const creditKey = cacheKey(credential.region, credential.uid)
+  const cached = state.credits.get(creditKey)
+  const creditsStale = cached === undefined || Date.now() - cached.at >= CREDIT_CACHE_MS
+  if (creditsStale && !failedRecently(state, creditKey)) return true
+  const probeKey = cacheKey(credential.region, credential.uid, WORKBUDDY_FLASH_MODEL)
+  const probeStale = probeFor(state, credential, WORKBUDDY_FLASH_MODEL) === undefined
+  return probeStale && !failedRecently(state, probeKey)
+}
+
+/**
+ * Probe and credit requests are cheap but not free, and the panel used to fire
+ * one pair per account at once. Three at a time keeps a five-account pool from
+ * turning into a burst the gateways rate limit.
+ */
+const REFRESH_CONCURRENCY = 3
+
+async function mapLimit<T, R>(
+  items: readonly T[],
+  limit: number,
+  run: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length)
+  let next = 0
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const index = next++
+      if (index >= items.length) return
+      results[index] = await run(items[index]!)
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker))
+  return results
 }
 
 async function creditsFor(
@@ -206,11 +279,14 @@ async function creditsFor(
   const key = cacheKey(credential.region, credential.uid)
   const cached = state.credits.get(key)
   if (cached !== undefined && Date.now() - cached.at < CREDIT_CACHE_MS) return cached.total
+  if (failedRecently(state, key)) return cached?.total
   try {
     const credits = await client.fetchCredits(credential)
     state.credits.set(key, { total: credits.totalBalance, at: Date.now() })
+    state.failures.delete(key)
     return credits.totalBalance
   } catch {
+    state.failures.set(key, Date.now())
     return cached?.total
   }
 }
@@ -236,24 +312,66 @@ function probeFor(
   return cached.probe
 }
 
+/**
+ * The verdict a row should show right now.
+ *
+ * This is the last answer even if it has aged out of the cache window, so rows
+ * keep their verdict while a refresh runs instead of blanking on every poll.
+ * The one exception is an expired rate limit: once the upstream's own reset
+ * time has passed, "limited until 18:47" is no longer true, and repeating it
+ * would keep a usable account looking blocked.
+ */
+function displayProbe(
+  state: WorkBuddyAccountRouteState,
+  credential: WorkBuddyCredential,
+  model: string,
+): WorkBuddyWebProbe | undefined {
+  const cached = state.probes.get(cacheKey(credential.region, credential.uid, model))
+  if (cached === undefined) return undefined
+  if (
+    cached.probe.verdict === 'rate-limited'
+    && cached.probe.resetsAtMs !== undefined
+    && Date.now() >= cached.probe.resetsAtMs
+  ) {
+    return undefined
+  }
+  return cached.probe
+}
+
 async function probeAccount(
   state: WorkBuddyAccountRouteState,
   client: WorkBuddyUpstreamClient,
   credential: WorkBuddyCredential,
   model: string,
 ): Promise<WorkBuddyWebProbe> {
-  const result = await client.probeModel(credential, model)
-  const probe: WorkBuddyWebProbe = {
-    verdict: result.verdict,
-    model,
-    ...(result.resetsAtMs === undefined ? {} : { resetsAtMs: result.resetsAtMs }),
-    checkedAt: result.checkedAt,
-    ...(result.detail === undefined ? {} : { detail: result.detail }),
+  const key = cacheKey(credential.region, credential.uid, model)
+  try {
+    const result = await client.probeModel(credential, model)
+    const probe: WorkBuddyWebProbe = {
+      verdict: result.verdict,
+      model,
+      ...(result.resetsAtMs === undefined ? {} : { resetsAtMs: result.resetsAtMs }),
+      checkedAt: result.checkedAt,
+      ...(result.detail === undefined ? {} : { detail: result.detail }),
+    }
+    state.probes.set(key, { probe, at: Date.now() })
+    state.failures.delete(key)
+    return probe
+  } catch (error: unknown) {
+    state.failures.set(key, Date.now())
+    throw error
   }
-  state.probes.set(cacheKey(credential.region, credential.uid, model), { probe, at: Date.now() })
-  return probe
 }
 
+/**
+ * One lane, answered from memory only.
+ *
+ * Reading the pool and the desktop sign-in is local file work (fast), but the
+ * balances and verdicts are network round trips. Serving whatever the caches
+ * hold and letting `refreshRegion` fill in the rest is what turns a settings
+ * dialog that sat on "reading both accounts" for seconds into one that paints
+ * immediately and fills in each row as its answer arrives.
+ */
 async function regionView(
   region: WorkBuddyRegion,
   deps: WorkBuddyDualAccountRouteOptions,
@@ -266,31 +384,16 @@ async function regionView(
   // with a pooled account in use, `current()` is that pool entry and the
   // "app sign-in" row would repeat the selected account's name.
   const fallbackCredential = await store.fallback()
-  let fallbackCredits: number | undefined
-  let fallbackProbe: WorkBuddyWebProbe | undefined
-  if (fallbackCredential !== undefined) {
-    try {
-      fallbackCredits = await creditsFor(state, deps.client, fallbackCredential)
-      fallbackProbe = probeFor(state, fallbackCredential, WORKBUDDY_FLASH_MODEL)
-        ?? await probeAccount(state, deps.client, fallbackCredential, WORKBUDDY_FLASH_MODEL)
-    } catch {
-      // Same rule as pool rows: one unreachable sign-in must not blank the panel.
-    }
-  }
+  const fallbackCredits = fallbackCredential === undefined
+    ? undefined
+    : cachedCredits(state, fallbackCredential)
+  const fallbackProbe = fallbackCredential === undefined
+    ? undefined
+    : displayProbe(state, fallbackCredential, WORKBUDDY_FLASH_MODEL)
 
-  const accounts = await Promise.all(doc.accounts.map(async (account): Promise<WorkBuddyWebAccount> => {
-    const key = cacheKey(region, account.uid)
-    let credits = state.credits.get(key)?.total
-    let probe = state.probes.get(cacheKey(region, account.uid, WORKBUDDY_FLASH_MODEL))?.probe
-    try {
-      const credential = await usableCredential(pool, account, deps.client)
-      credits = await creditsFor(state, deps.client, credential)
-      probe = probeFor(state, credential, WORKBUDDY_FLASH_MODEL)
-        ?? await probeAccount(state, deps.client, credential, WORKBUDDY_FLASH_MODEL)
-    } catch {
-      // A single unreachable account must not blank the whole list; the row
-      // still renders, just without a fresh verdict.
-    }
+  const accounts = doc.accounts.map((account): WorkBuddyWebAccount => {
+    const credits = state.credits.get(cacheKey(region, account.uid))?.total
+    const probe = displayProbe(state, toCredential(account), WORKBUDDY_FLASH_MODEL)
     return {
       uid: account.uid,
       displayName: displayNameFor(account),
@@ -302,7 +405,7 @@ async function regionView(
       ...(credits === undefined ? {} : { credits }),
       ...(probe === undefined ? {} : { probe }),
     }
-  }))
+  })
 
   return {
     region,
@@ -314,7 +417,108 @@ async function regionView(
     usingFallback: doc.activeUid === undefined,
     accounts,
     probeModel: WORKBUDDY_FLASH_MODEL,
+    // Busy means "a request is still outstanding", not "a pass is scheduled":
+    // a pass that finds everything cached makes no requests, and reporting it
+    // would keep the panel polling forever for nothing.
+    refreshing: state.refreshing.has(region) && regionHasPendingWork(state, region, doc, fallbackCredential),
   }
+}
+
+/** Whether any sign-in in this lane still needs a network round trip. */
+function regionHasPendingWork(
+  state: WorkBuddyAccountRouteState,
+  region: WorkBuddyRegion,
+  doc: { accounts: readonly WorkBuddyPoolAccount[] },
+  fallbackCredential: WorkBuddyCredential | undefined,
+): boolean {
+  if (fallbackCredential !== undefined && needsWork(state, fallbackCredential)) return true
+  return doc.accounts.some(account => needsWork(state, toCredential(account)))
+}
+
+/**
+ * Fetch the missing balances and verdicts for one lane.
+ *
+ * Only entries whose cache expired are requested, so re-opening the panel
+ * spends nothing; a lane that is already refreshing is left alone instead of
+ * stacking a second round of probes behind the first.
+ */
+async function refreshRegion(
+  region: WorkBuddyRegion,
+  deps: WorkBuddyDualAccountRouteOptions,
+  state: WorkBuddyAccountRouteState,
+): Promise<void> {
+  const pool = deps.store.poolFor(region)
+  const store = deps.store.storeFor(region)
+  const doc = await pool.get()
+  const fallbackCredential = await store.fallback()
+
+  const fill = async (credential: WorkBuddyCredential): Promise<void> => {
+    try {
+      await creditsFor(state, deps.client, credential)
+      const probeKey = cacheKey(credential.region, credential.uid, WORKBUDDY_FLASH_MODEL)
+      if (probeFor(state, credential, WORKBUDDY_FLASH_MODEL) === undefined && !failedRecently(state, probeKey)) {
+        await probeAccount(state, deps.client, credential, WORKBUDDY_FLASH_MODEL)
+      }
+    } catch {
+      // A single unreachable account must not blank the whole list; the row
+      // keeps whatever verdict it had and the next poll tries again.
+    }
+  }
+
+  const work: Array<() => Promise<void>> = []
+  const seen = new Set<string>()
+  if (fallbackCredential !== undefined) {
+    seen.add(cacheKey(region, fallbackCredential.uid))
+    if (needsWork(state, fallbackCredential)) {
+      work.push(async () => {
+        await fill(fallbackCredential)
+      })
+    }
+  }
+  for (const account of doc.accounts) {
+    // The desktop sign-in is often imported into the pool as well. Probing it
+    // twice would spend two requests for one answer, so key on the uid.
+    const key = cacheKey(region, account.uid)
+    if (seen.has(key)) continue
+    seen.add(key)
+    if (!needsWork(state, toCredential(account))) continue
+    work.push(async () => {
+      // A pooled token near expiry has to be renewed before it can be used.
+      const credential = await usableCredential(pool, account, deps.client)
+      await fill(credential)
+    })
+  }
+
+  // Everything was still fresh: no requests, so the lane never looks busy.
+  if (work.length === 0) return
+  await mapLimit(work, REFRESH_CONCURRENCY, run => run())
+}
+
+/**
+ * Start a lane's refresh unless one is already running.
+ *
+ * `requeue` is only for callers that changed the state (a switch, an import, a
+ * removal): those need a second pass even if one is mid-flight. Polls must not
+ * set it, or a panel that re-reads while waiting would queue a new pass for
+ * every poll and never settle.
+ */
+function kickRefresh(
+  region: WorkBuddyRegion,
+  deps: WorkBuddyDualAccountRouteOptions,
+  state: WorkBuddyAccountRouteState,
+  requeue = false,
+): void {
+  if (state.refreshing.has(region)) {
+    if (requeue) state.queued.add(region)
+    return
+  }
+  const task = refreshRegion(region, deps, state)
+    .catch(() => {})
+    .finally(() => {
+      state.refreshing.delete(region)
+      if (state.queued.delete(region)) kickRefresh(region, deps, state)
+    })
+  state.refreshing.set(region, task)
 }
 
 export async function workBuddyAccountsView(
@@ -326,6 +530,28 @@ export async function workBuddyAccountsView(
     regionView('global', deps, state),
   ])
   return { cn, global }
+}
+
+/**
+ * Run both lanes' refresh and wait for it.
+ *
+ * The HTTP route never awaits this: it starts the refresh and answers from
+ * cache. Tests and the CLI status command use it when they want the settled
+ * view, and `kickRefresh` is idempotent so overlapping with a poll is safe.
+ */
+export async function workBuddyAccountsRefresh(
+  deps: WorkBuddyDualAccountRouteOptions,
+  state: WorkBuddyAccountRouteState,
+): Promise<void> {
+  kickRefresh('cn', deps, state)
+  kickRefresh('global', deps, state)
+  // A pass can queue a follow-up when the caller changed state, so drain until
+  // both lanes are idle rather than awaiting one generation.
+  for (let guard = 0; guard < 8; guard++) {
+    const pending = [state.refreshing.get('cn'), state.refreshing.get('global')]
+    if (pending.every(task => task === undefined)) return
+    await Promise.all(pending.map(task => task?.catch(() => {})))
+  }
 }
 
 export function parseAccountAction(value: unknown): WorkBuddyAccountAction {
@@ -416,18 +642,25 @@ async function applyAction(
       if (action.uid !== undefined && targets.length === 0) {
         throw new Error(`account not in the ${action.region} pool`)
       }
-      await Promise.all(targets.map(async account => {
+      // An explicit check is the one place that waits: the user asked for a
+      // fresh verdict and is watching the row. Concurrent probes are capped so
+      // "check all" does not fire a burst at the gateway.
+      await mapLimit(targets, REFRESH_CONCURRENCY, async account => {
         try {
           const credential = await usableCredential(pool, account, deps.client)
           await probeAccount(state, deps.client, credential, model)
         } catch {
           // Leave the previous verdict in place; the row shows what we knew.
         }
-      }))
+      })
       break
     }
   }
 
+  // Let the background pass fill in anything the mutation invalidated; the
+  // response itself only carries what is already known. This one requeues: a
+  // switch during a running pass would otherwise return a stale view.
+  kickRefresh(action.region, deps, state, true)
   return await workBuddyAccountsView(deps, state)
 }
 
@@ -442,6 +675,11 @@ export function workBuddyAccountHandler(
     }
     try {
       if (req.method === 'GET') {
+        // Answer with what is already known and refresh behind the response.
+        // The panel polls this route, so the verdicts land a moment later
+        // instead of the dialog waiting on every gateway round trip first.
+        kickRefresh('cn', deps, state)
+        kickRefresh('global', deps, state)
         json(res, 200, await workBuddyAccountsView(deps, state))
         return
       }

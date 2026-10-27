@@ -363,6 +363,72 @@ declare class WorkBuddyDualSelectionStore {
   private load;
 }
 //#endregion
+//#region src/agenttool.d.ts
+type AgentToolErrorKind = 'auth' | 'client' | 'server' | 'timeout' | 'aborted';
+/** Why one `agenttool` call failed; `kind` drives the Harness retry policy. */
+declare class AgentToolError extends Error {
+  readonly kind: AgentToolErrorKind;
+  readonly status: number;
+  constructor(message: string, kind: AgentToolErrorKind, status?: number);
+}
+interface AgentToolSearchResult {
+  sources: Array<{
+    url: string;
+    title?: string;
+    snippet?: string;
+  }>;
+  truncated: boolean;
+}
+interface AgentToolFetchResult {
+  url: string;
+  title?: string;
+  content: string;
+  contentType?: string;
+}
+interface AgentToolClient {
+  search(credential: WorkBuddyCredential, query: string, maxResults: number | undefined, signal: AbortSignal | undefined): Promise<AgentToolSearchResult>;
+  fetch(credential: WorkBuddyCredential, url: string, signal: AbortSignal | undefined): Promise<AgentToolFetchResult>;
+}
+declare function createAgentToolClient(): AgentToolClient;
+//#endregion
+//#region src/native-web.d.ts
+declare const WORKBUDDY_NATIVE_SEARCH_SERVICE = "workbuddyNativeSearch";
+declare const WORKBUDDY_NATIVE_FETCH_SERVICE = "workbuddyNativeFetch";
+interface WorkBuddyNativeSearch {
+  available(): boolean;
+  search(query: string, options?: {
+    region?: WorkBuddyRegion;
+    model?: string;
+    maxResults?: number;
+    signal?: AbortSignal;
+  }): Promise<AgentToolSearchResult>;
+}
+interface WorkBuddyNativeFetch {
+  available(): boolean;
+  fetch(url: string, options?: {
+    region?: WorkBuddyRegion;
+    signal?: AbortSignal;
+  }): Promise<AgentToolFetchResult>;
+}
+interface WorkBuddyNativeWebOptions {
+  store: WorkBuddyDualCredentialStore;
+  client: AgentToolClient;
+  /** Region of the model this turn is running, so one credential serves both. */
+  resolveRegion?: () => WorkBuddyRegion | undefined;
+  logger?: {
+    warn: (message: string, ...args: unknown[]) => void;
+  };
+}
+declare function createWorkBuddyNativeWeb(options: WorkBuddyNativeWebOptions): {
+  search: WorkBuddyNativeSearch;
+  fetch: WorkBuddyNativeFetch;
+};
+/** Publish both services on the plugin context, the way `dsh-grok-oauth` does. */
+declare function provideWorkBuddyNativeWeb(ctx: Context, web: {
+  search: WorkBuddyNativeSearch;
+  fetch: WorkBuddyNativeFetch;
+}): void;
+//#endregion
 //#region src/account-paths.d.ts
 declare const WORKBUDDY_DUAL_ACCOUNTS_PATH = "/plugins/dsh-workbuddy-dual/accounts";
 /**
@@ -413,6 +479,14 @@ interface WorkBuddyWebRegionAccounts {
   accounts: readonly WorkBuddyWebAccount[];
   /** Model whose availability the rows report. */
   probeModel: string;
+  /**
+   * True while this lane is still checking balances or probing upstream.
+   *
+   * The route answers from cache first and refreshes in the background, so the
+   * panel paints instantly and fills in verdicts as they arrive instead of
+   * holding the whole settings dialog until every account answered.
+   */
+  refreshing: boolean;
 }
 interface WorkBuddyWebAccounts {
   cn: WorkBuddyWebRegionAccounts;
@@ -439,6 +513,12 @@ declare function readAuthFile(path: string, region: WorkBuddyRegion): Promise<Wo
 interface WorkBuddyAccountRouteState {
   credits: Map<string, CachedCredits>;
   probes: Map<string, CachedProbe>;
+  /** One in-flight background refresh per lane, so polling cannot stack them. */
+  refreshing: Map<WorkBuddyRegion, Promise<void>>;
+  /** Lanes asked to refresh again as soon as the current pass finishes. */
+  queued: Set<WorkBuddyRegion>;
+  /** Epoch ms of the last failure per cache key, so a dead token backs off. */
+  failures: Map<string, number>;
 }
 declare function createAccountRouteState(): WorkBuddyAccountRouteState;
 declare function workBuddyAccountsView(deps: WorkBuddyDualAccountRouteOptions, state: WorkBuddyAccountRouteState): Promise<WorkBuddyWebAccounts>;
@@ -454,4 +534,4 @@ declare const name = "dsh-workbuddy-dual";
 declare const inject: readonly ["llm"];
 declare function apply(ctx: Context, config?: WorkBuddyDualConfig): void;
 //#endregion
-export { Config, WORKBUDDY_CN_PROVIDER, WORKBUDDY_DUAL_ACCOUNTS_PATH, WORKBUDDY_DUAL_SETTINGS_NS, WORKBUDDY_FLASH_MODEL, WORKBUDDY_GLOBAL_PROVIDER, WorkBuddyAccountPool, WorkBuddyDualCatalog, WorkBuddyDualConfig, WorkBuddyDualCredentialStore, type WorkBuddyDualSelection, WorkBuddyDualSelectionStore, WorkBuddyUpstreamClient, advertisedModelIds, apply, createAccountRouteState, createWorkBuddyDualAdapter, createWorkBuddyDualShim, defaultSelection, filterModels, inject, name, normalizeLanePreference, normalizeSelection, poolDocumentPath, readAuthFile, toCredential, workBuddyAccountsView };
+export { AgentToolError, Config, WORKBUDDY_CN_PROVIDER, WORKBUDDY_DUAL_ACCOUNTS_PATH, WORKBUDDY_DUAL_SETTINGS_NS, WORKBUDDY_FLASH_MODEL, WORKBUDDY_GLOBAL_PROVIDER, WORKBUDDY_NATIVE_FETCH_SERVICE, WORKBUDDY_NATIVE_SEARCH_SERVICE, WorkBuddyAccountPool, WorkBuddyDualCatalog, WorkBuddyDualConfig, WorkBuddyDualCredentialStore, type WorkBuddyDualSelection, WorkBuddyDualSelectionStore, WorkBuddyUpstreamClient, advertisedModelIds, apply, createAccountRouteState, createAgentToolClient, createWorkBuddyDualAdapter, createWorkBuddyDualShim, createWorkBuddyNativeWeb, defaultSelection, filterModels, inject, name, normalizeLanePreference, normalizeSelection, poolDocumentPath, provideWorkBuddyNativeWeb, readAuthFile, toCredential, workBuddyAccountsView };

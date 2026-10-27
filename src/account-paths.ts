@@ -55,6 +55,14 @@ export interface WorkBuddyWebRegionAccounts {
   accounts: readonly WorkBuddyWebAccount[]
   /** Model whose availability the rows report. */
   probeModel: string
+  /**
+   * True while this lane is still checking balances or probing upstream.
+   *
+   * The route answers from cache first and refreshes in the background, so the
+   * panel paints instantly and fills in verdicts as they arrive instead of
+   * holding the whole settings dialog until every account answered.
+   */
+  refreshing: boolean
 }
 
 export interface WorkBuddyWebAccounts {

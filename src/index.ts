@@ -25,7 +25,9 @@ import { WorkBuddyUpstreamClient } from './upstream.ts'
 import { registerWorkBuddyDualStatusRoute } from './web-status.ts'
 import { registerWorkBuddyDualAccountRoutes } from './account-route.ts'
 import { clearHostHeartbeat, writeHostHeartbeat } from './host-heartbeat.ts'
-import type { WorkBuddyModelInfo } from './types.ts'
+import { createAgentToolClient } from './agenttool.ts'
+import { createWorkBuddyNativeWeb, provideWorkBuddyNativeWeb } from './native-web.ts'
+import type { WorkBuddyModelInfo, WorkBuddyRegion } from './types.ts'
 
 export {
   WORKBUDDY_CN_PROVIDER,
@@ -38,6 +40,13 @@ export { WorkBuddyUpstreamClient } from './upstream.ts'
 export { createWorkBuddyDualShim } from './shim.ts'
 export { WorkBuddyDualSelectionStore } from './selection-store.ts'
 export { WorkBuddyAccountPool, poolDocumentPath, toCredential } from './accounts.ts'
+export {
+  createWorkBuddyNativeWeb,
+  provideWorkBuddyNativeWeb,
+  WORKBUDDY_NATIVE_FETCH_SERVICE,
+  WORKBUDDY_NATIVE_SEARCH_SERVICE,
+} from './native-web.ts'
+export { AgentToolError, createAgentToolClient } from './agenttool.ts'
 export { WORKBUDDY_DUAL_ACCOUNTS_PATH, WORKBUDDY_FLASH_MODEL } from './account-paths.ts'
 export { createAccountRouteState, readAuthFile, workBuddyAccountsView } from './account-route.ts'
 export {
@@ -77,6 +86,45 @@ export function apply(ctx: Context, config: WorkBuddyDualConfig = {}): void {
   const selection = new WorkBuddyDualSelectionStore()
   const shim = createWorkBuddyDualShim({ store, client, catalog, logger: ctx.logger })
 
+  /**
+   * Region of the model this turn runs, read the same way web-search-follow
+   * reads its route: the live request header first, then the last selection.
+   * Only used to pick which WorkBuddy sign-in pays for a hosted web tool.
+   */
+  const currentRegion = (): WorkBuddyRegion | undefined => {
+    const agents = ctx.get('agents') as
+      | { currentInitiator?: () => { session?: { requestHeader?: () => unknown }; options?: { provider?: unknown } } | undefined }
+      | undefined
+    const agent = typeof agents?.currentInitiator === 'function' ? agents.currentInitiator() : undefined
+    const readProvider = (value: unknown): string | undefined => {
+      if (typeof value !== 'object' || value === null) return undefined
+      const record = value as Record<string, unknown>
+      const header = typeof record['header'] === 'object' && record['header'] !== null
+        ? record['header'] as Record<string, unknown>
+        : record
+      const inner = typeof header['config'] === 'object' && header['config'] !== null
+        ? header['config'] as Record<string, unknown>
+        : header
+      return typeof inner['provider'] === 'string' ? inner['provider'] : undefined
+    }
+    let provider: string | undefined
+    try {
+      provider = readProvider(agent?.session?.requestHeader?.())
+    } catch {}
+    provider ??= readProvider(agent?.options)
+    if (provider === WORKBUDDY_GLOBAL_PROVIDER) return 'global'
+    if (provider === WORKBUDDY_CN_PROVIDER) return 'cn'
+    return undefined
+  }
+
+  const nativeWeb = createWorkBuddyNativeWeb({
+    store,
+    client: createAgentToolClient(),
+    resolveRegion: currentRegion,
+    logger: ctx.logger,
+  })
+  provideWorkBuddyNativeWeb(ctx, nativeWeb)
+
   let stopped = false
   let invalidate: (() => void) | undefined
 
@@ -109,18 +157,25 @@ export function apply(ctx: Context, config: WorkBuddyDualConfig = {}): void {
     registerWorkBuddyDualAccountRoutes(webCtx, {
       store,
       client,
-      async onAccountChange(region) {
+      onAccountChange(region) {
         // A different account can carry a different model catalog (an
         // enterprise sign-in may expose models a personal one does not), so
         // re-read the catalog and let every picker refresh.
-        try {
-          const credential = await store.storeFor(region).current()
-          if (credential === undefined) return
-          const models = await client.fetchModels(credential)
-          adoptCatalog(region, models)
-        } catch (error: unknown) {
-          ctx.logger.warn(`dsh-workbuddy-dual: could not refresh the ${region} catalog after switching accounts`, error)
-        }
+        //
+        // This is deliberately not awaited: switching accounts already costs a
+        // pool write, and making the click wait on a gateway catalog read adds
+        // a round trip to a button that used to feel instant. The picker
+        // refreshes when the answer lands.
+        void (async () => {
+          try {
+            const credential = await store.storeFor(region).current()
+            if (credential === undefined) return
+            const models = await client.fetchModels(credential)
+            adoptCatalog(region, models)
+          } catch (error: unknown) {
+            ctx.logger.warn(`dsh-workbuddy-dual: could not refresh the ${region} catalog after switching accounts`, error)
+          }
+        })()
       },
     })
     registerWorkBuddyDualModelRoutes(webCtx, {

@@ -16,6 +16,9 @@ type Notice = { kind: 'ok' | 'error'; text: string } | undefined
 const LANES = ['cn', 'global'] as const
 type Lane = (typeof LANES)[number]
 
+/** How often to re-read the account list while a lane is still refreshing. */
+const REFRESH_POLL_MS = 1200
+
 function readError(payload: unknown, fallback: string): string {
   if (typeof payload === 'object' && payload !== null) {
     const error = (payload as Record<string, unknown>)['error']
@@ -196,6 +199,7 @@ function RegionAccounts({
   t: Translate
 }) {
   const disabled = busy !== undefined
+  const refreshing = data?.refreshing === true
   return (
     <div
       style={{
@@ -211,6 +215,11 @@ function RegionAccounts({
         <span style={{ fontSize: 11, color: 'var(--text-secondary, #6b7280)' }}>
           {data?.probeModel ?? ''}
         </span>
+        {refreshing && (
+          <span style={{ fontSize: 11, color: 'var(--text-secondary, #6b7280)' }}>
+            {t('checkingInBackground')}
+          </span>
+        )}
         <div style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
           <button
             type="button"
@@ -231,7 +240,11 @@ function RegionAccounts({
         </div>
       </div>
 
-      {data === undefined ? null : (
+      {data === undefined ? (
+        <div style={{ fontSize: 11.5, color: 'var(--text-secondary, #6b7280)', padding: '6px 0' }}>
+          {t('accountsLoading')}
+        </div>
+      ) : (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
           {data.accounts.length === 0 && (
             <div style={{ fontSize: 11.5, color: 'var(--text-secondary, #6b7280)', padding: '6px 0' }}>
@@ -309,20 +322,34 @@ export function WorkBuddyAccountList({ t }: { t: Translate }) {
 
   useEffect(() => {
     mounted.current = true
-    void (async () => {
+    let timer: ReturnType<typeof setTimeout> | undefined
+
+    const load = async (): Promise<void> => {
       try {
         const response = await fetch(WORKBUDDY_DUAL_ACCOUNTS_PATH, { credentials: 'same-origin' })
         const payload: unknown = await response.json()
         if (!response.ok) throw new Error(readError(payload, t('requestFailed')))
-        if (mounted.current) setView(payload as WorkBuddyWebAccounts)
+        if (!mounted.current) return
+        const next = payload as WorkBuddyWebAccounts
+        setView(next)
+        setNotice(undefined)
+        // The route answers from cache and refreshes behind the response, so
+        // poll while a lane still reports work in flight. This is what lets the
+        // panel paint at once and fill in verdicts as they arrive.
+        if (next.cn.refreshing || next.global.refreshing) {
+          timer = setTimeout(() => void load(), REFRESH_POLL_MS)
+        }
       } catch (error: unknown) {
         if (mounted.current) {
           setNotice({ kind: 'error', text: t('accountActionFailed', { error: error instanceof Error ? error.message : String(error) }) })
         }
       }
-    })()
+    }
+
+    void load()
     return () => {
       mounted.current = false
+      if (timer !== undefined) clearTimeout(timer)
     }
   }, [])
 

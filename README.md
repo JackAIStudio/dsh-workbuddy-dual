@@ -22,10 +22,11 @@
   - 每一端各有自己的账号名单（`$DSH_HOME/.workbuddy-dual-accounts-cn.json` / `-global.json`），不再只有"当前这一份凭据"。
   - 面板里点「用这个」即切号，下一条请求就用新账号；选中的账号优先于 WorkBuddy 客户端登录的号。点「用这个」于客户端登录行可退回客户端登录。
   - 「导入当前登录」把 WorkBuddy 客户端此刻登录的账号加进名单。
+  - **面板不再等网络**：账号页先用缓存立刻画出来，余额和 Flash 状态在后台补齐。首次打开约 0.1 秒出界面，全部结果通常 2～3 秒到齐，之后再打开是毫秒级。每个账号的探测并发不超过 3 个；上游失败后退避 20 秒再试，一个失效 token 不会让面板一直转圈。
 - **DeepSeek-V4.1-Flash 真实可用性检测**：
   - 每个账号都显示 Flash 能否跑：`✅ 可用`、`⛔ 限流 + 解禁时间`、`⛔ 已封禁`、`⛔ 余额不足`、`⛔ 登录失效`。
   - 检测是真发一次 1 token 的流式请求，所以回答的是"此刻能不能跑"，而不是从余额推断。限流时直接读上游返回的解禁时间，不估算。
-  - 面板打开即检测，结果缓存 45 秒；过了上游给的时间就重新检测，不会一直挂着一条已失效的"限流"。
+  - 面板打开即检测，结果缓存 45 秒；过了上游给的时间就重新检测，不会一直挂着一条已失效的"限流"。检测在后台跑，界面不等它。
   - 面板按“能不能干活”排序：Flash 状态在前，积分退到右侧。一个限流的号可能躺着两千多分却几小时用不上。
 - **模型自选与双轨开关**：
   - “WorkBuddy 双轨”设置页新增「要显示哪些模型」：每条轨可以单独启用或关闭；显示范围可选「全部模型」或「只显示勾选」。
@@ -35,9 +36,22 @@
 - **轻量本地 Loopback 分流**：
   - 单个本地 Loopback 代理网关，自动识别请求前缀并分发至对应的腾讯云国内或海外 APISIX 网关。
 - **国内版渠道校验兼容（11128）**：
-  - 国内网关会对 system 提示词做渠道校验：提示词里带着别家 Harness 的品牌串时，请求在模型调用前就被拒绝，返回 `400 / 11128 Illegal API invocation from an unapproved channel`。典型现象是所有模型都发不出消息，但用一个简单 system 提示词却能通。
-  - Loopback 在转发前只改写 system 消息里的这一处品牌串（`DeepSeek Harness` → `DeepSeek-Harness`），语义不变，用户自己的消息内容不动。
+  - 国内网关会对 system 提示词做渠道校验：命中它的特征后，请求在模型调用前就被拒绝，返回 `400 / 11128 Illegal API invocation from an unapproved channel`。典型现象是所有模型都发不出消息，但用一个简单 system 提示词却能通。
+  - 这道校验看过两轮。第一轮认的是别家 Harness 的品牌串（`DeepSeek Harness`），改写成品名连字符形式（`DeepSeek-Harness`）即可绕过；这一轮已不再拦它。
+  - 现在的判定看**版式**：整段提示词全部用单空格连接句子时会被拒，句间换成换行则放行，其余字节完全相同。实测同一份 DSH 提示词原样发送 5 次全拦、只改句间分隔后 5 次全通；图片、工具表、推理档位、trace 头都不参与判定。海外版不做这项检查。
+  - Loopback 因此在转发前对 **CN** 轨道的 system 文本做两处处理：品牌串归一化，以及把句末标点后半角空格接下一句的位置换成换行。代码块、列表、缩进块和用户消息原样不动，文字一个也不增删。
+  - 同一道校验还看**开头是不是别家客户端的身份串**。Claude Code 把 `You are Claude Code, Anthropic's official CLI for Claude.` 作为第一个 system 块发出来，CN 网关同样回 11128，于是 Claude（经 OpenCodex 走 CN 轨道）每一轮都失败。这条只看开头：同一句话前面多一个空格、一个换行或一句别的话就放行。
+  - Loopback 对以这句身份声明开头的 system 文本，把 `Claude Code,` 后面的逗号换成破折号。词序和语义不变，只差一个标点；出现在正文中间的同名句子不动，海外轨道也不动。
   - 该问题与请求头、工具表、模型、账号额度、推理档位都无关；换哪个模型都会同样被拦。
+- **Kimi 工具 schema 校验兼容（11133）**：
+  - 国内网关上的 Kimi 系列（`kimi-k3.1-pro` 等）会严格校验工具参数 schema：只要任何一个工具里出现 `enum` 却没有同级的 `type`，整个请求就被拒成 `400 / 11133 Invalid request parameters`，连模型都没跑到。同一份请求换 `glm-5.3` 能通，海外网关的 Kimi 也能通，所以很容易被当成"这个模型坏了"。
+  - `enum` 不带 `type` 本身是合法的 JSON Schema，第三方 MCP server 经常这么写。典型触发者是 `cua-driver` 的 `parse_visual_regions`，它的 `kinds` 参数是 `anyOf[数组, null]`，数组的 `items` 里只有 `enum: ["text", "icon"]`。
+  - Loopback 在转发前给每个缺 `type` 的 `enum` 补上它唯一的 JSON 类型（`items`、`anyOf` 里的也算），声明过的 `type` 和类型混杂的 `enum` 一律不动。
+- **Web 搜索与网页抓取（原生托管）**：
+  - 插件把 WorkBuddy 自己的 `/agenttool/v1/search` 和 `/agenttool/v1/webfetch` 暴露成 `workbuddyNativeSearch` / `workbuddyNativeFetch` 两个服务，配合 [`dsh-web-search-follow`](https://github.com/JackAIStudio/dsh-web-search-follow) ≥ 0.3 使用。
+  - 用的是当前轨道**已经登录的那个账号**，不额外配 key、不额外花钱；国内版走国内网关，海外版走海外网关，会话里选哪个轨道就花哪个账号。
+  - `web_fetch` 由服务端代抓，因此不受本机 Clash / fake-ip 影响。国内网关自身会按域名策略拒绝一部分站点（例如 `anthropic.com`、`openai.com` 返回 `403 / 15021 domain rejected by via routing policy`），此时换海外版轨道或换域名，插件不会在本机绕过去。
+  - 没有装 `dsh-web-search-follow` 时这两个服务只是注册着没人用，不影响原有功能。
 - **长会话请求体积防护（413 / 图片自动卸载）**：
   - 两个网关都在约 16 MB 处拒收整个请求体，但报错会伪装成别的问题：国内版返回 `400 / 11133 Invalid request parameters`，海外版返回裸 `500`，都不提体积。
   - 插件把 `maxRequestImageBytes` 设在网关上限以下（约束见 [`src/budget.ts`](./src/budget.ts)），所以长会话在撑爆网关**之前**就会拿到 `IMAGE_OFFLOAD_REQUIRED`，由 DSH 内置的 `dsh-compaction-image-offload` 把最老的截图换成占位符并自动重试。历史越长越会丢旧图，但会话能继续跑下去。

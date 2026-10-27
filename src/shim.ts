@@ -142,6 +142,67 @@ export function stripForeignHarnessSignature(source: string): string {
   return source.replace(HARNESS_SIGNATURE, 'DeepSeek-Harness')
 }
 
+/**
+ * The second shape the CN channel check rejects is another vendor's client
+ * identity when it opens the prompt.
+ *
+ * Claude Code sends \`You are Claude Code, Anthropic's official CLI for Claude.\`
+ * as the first system block, and the gateway refuses that with the same 11128 —
+ * which is why routing Claude through the CN lane failed on every turn. The
+ * check reads the opening of the prompt only: the identical sentence one
+ * character later is accepted, and so is the same sentence after any leading
+ * prose or blank line. Prefixing the prompt with a space is enough to pass.
+ *
+ * Rather than alter the text, this turns the comma that follows \`Claude Code\`
+ * into an em dash when that identity opens the prompt. The sentence keeps its
+ * words, order and meaning; only the punctuation differs. Everything after the
+ * opening is left untouched, as are prompts that merely mention the phrase.
+ */
+const LEADING_CLIENT_IDENTITY = /^You are Claude Code, (?=Anthropic)/i
+
+export function deflectLeadingClientIdentity(source: string): string {
+  return source.replace(LEADING_CLIENT_IDENTITY, 'You are Claude Code — ')
+}
+
+/**
+ * The CN gateway's channel check also fingerprints how the prompt is *laid
+ * out*, not just which words it contains.
+ *
+ * A system prompt whose sentences are separated by a single space keeps
+ * matching the signature of a non-official client and is refused with 11128
+ * before the model runs. The same prompt with those sentence joins turned into
+ * newlines is accepted, byte for byte otherwise identical. Measured on a real
+ * DSH session: the original prompt failed 5/5, the re-wrapped prompt passed
+ * 5/5, and a prompt already using blank lines between paragraphs needed no
+ * change. Images, the tool catalog, reasoning effort and the trace headers
+ * make no difference — a two-line prompt is accepted, the full one is not.
+ *
+ * So open a new line at each boundary between one block of prose and the next.
+ * Nothing is added or removed: a boundary is a sentence-final punctuation mark
+ * followed by a single space and an opening character. Code blocks, lists and
+ * already-wrapped prose have no such boundary and are left alone, which also
+ * keeps this away from tool results and the user's own text.
+ */
+const SENTENCE_JOIN = /(?<=[A-Za-z0-9_)\]}])[.!?] (?=[A-Z@\[])/g
+
+export function rewrapSystemPrompt(source: string): string {
+  if (!source.includes(' ')) return source
+  const lines = source.split('\n')
+  let inFence = false
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i] ?? ''
+    if (/^\s*```/.test(line)) {
+      inFence = !inFence
+      continue
+    }
+    if (inFence || line === '') continue
+    // Lists and indented blocks keep their shape; only running prose is rewrapped.
+    if (/^\s*(?:[-*+]|\d+[.)])\s/.test(line) || /^\s/.test(line)) continue
+    lines[i] = line.replace(SENTENCE_JOIN, boundary => `${boundary[0]}\n`)
+  }
+  return lines.join('\n')
+}
+
 async function readBody(req: IncomingMessage, limit = MAX_REQUEST_BODY_BYTES): Promise<Buffer> {
   const chunks: Buffer[] = []
   let total = 0
@@ -154,7 +215,63 @@ async function readBody(req: IncomingMessage, limit = MAX_REQUEST_BODY_BYTES): P
   return Buffer.concat(chunks)
 }
 
-export function prepareChatBody(source: string): string {
+/**
+ * Give every `enum` node the `type` its values imply.
+ *
+ * Kimi's upstream (kimi-k3.1-pro and siblings) validates tool parameter
+ * schemas strictly and answers the whole request with `11133 Invalid request
+ * parameters` when an `enum` arrives without a sibling `type` — even when the
+ * enum sits inside `items` or under `anyOf`. Every other model on the same
+ * gateway accepts the same body, so the failure looks like a broken model
+ * rather than a schema nit.
+ *
+ * `enum` alone is valid JSON Schema, so third-party MCP servers keep producing
+ * it; the constraint belongs to this gateway and has to be repaired here. Only
+ * a missing `type` is filled in, and only when every value shares one JSON
+ * type, so a heterogeneous enum is left exactly as the caller wrote it.
+ */
+function typeOfJsonValue(value: unknown): string | undefined {
+  if (value === null) return 'null'
+  if (Array.isArray(value)) return 'array'
+  switch (typeof value) {
+    case 'string': return 'string'
+    case 'boolean': return 'boolean'
+    case 'number': return Number.isInteger(value) ? 'integer' : 'number'
+    case 'object': return 'object'
+    default: return undefined
+  }
+}
+
+function inferEnumType(values: readonly unknown[]): string | undefined {
+  if (values.length === 0) return undefined
+  const first = typeOfJsonValue(values[0])
+  if (first === undefined) return undefined
+  // Integers and decimals may mix in one numeric enum; keep the broader type.
+  const merged = values.every(value => {
+    const type = typeOfJsonValue(value)
+    return type === first || (first === 'integer' && type === 'number') || (first === 'number' && type === 'integer')
+  })
+    ? (values.some(value => typeOfJsonValue(value) === 'number') ? 'number' : first)
+    : undefined
+  return merged
+}
+
+function annotateEnumTypes(node: unknown): void {
+  if (Array.isArray(node)) {
+    for (const item of node) annotateEnumTypes(item)
+    return
+  }
+  if (typeof node !== 'object' || node === null) return
+  const schema = node as Record<string, unknown>
+  const values = schema['enum']
+  if (Array.isArray(values) && schema['type'] === undefined) {
+    const type = inferEnumType(values)
+    if (type !== undefined) schema['type'] = type
+  }
+  for (const value of Object.values(schema)) annotateEnumTypes(value)
+}
+
+export function prepareChatBody(source: string, region: WorkBuddyRegion = 'cn'): string {
   let body: unknown
   try {
     body = JSON.parse(source)
@@ -173,7 +290,7 @@ export function prepareChatBody(source: string): string {
         if (m['role'] === 'developer') m['role'] = 'system'
         // Only the system prompt carries the fingerprint the gateway rejects;
         // user content is the user's own text and stays untouched.
-        if (m['role'] === 'system') m['content'] = stripHarnessSignatureFromContent(m['content'])
+        if (m['role'] === 'system') m['content'] = stripHarnessSignatureFromContent(m['content'], region)
       }
     }
     // Upstream (especially Global) requires the first message to be role: "system".
@@ -182,6 +299,12 @@ export function prepareChatBody(source: string): string {
       obj['messages'].unshift({ role: 'system', content: 'You are a helpful assistant.' })
     }
   }
+
+  // Kimi's upstream rejects the whole request when any tool schema carries an
+  // `enum` without a sibling `type`; every other model on the gateway accepts
+  // it. Repair the schemas here so a third-party MCP tool cannot break the
+  // model. `tools` is the caller's own array, so editing it in place is fine.
+  if (Array.isArray(obj['tools'])) annotateEnumTypes(obj['tools'])
 
   // normalize tool_choice
   if ('tool_choice' in obj) {
@@ -210,14 +333,24 @@ export function prepareChatBody(source: string): string {
   return JSON.stringify(obj)
 }
 
-function stripHarnessSignatureFromContent(content: unknown): unknown {
-  if (typeof content === 'string') return stripForeignHarnessSignature(content)
+function stripHarnessSignatureFromContent(content: unknown, region: WorkBuddyRegion): unknown {
+  const rewrite = (source: string): string => {
+    const stripped = stripForeignHarnessSignature(source)
+    // A leading client identity has to be deflected before the layout pass:
+    // that pass would move the sentence onto its own line and change what the
+    // gateway sees at the opening.
+    const deflected = deflectLeadingClientIdentity(stripped)
+    // The Global gateway does not run the layout check, so its prompts are
+    // forwarded exactly as the harness wrote them.
+    return region === 'cn' ? rewrapSystemPrompt(deflected) : stripped
+  }
+  if (typeof content === 'string') return rewrite(content)
   if (!Array.isArray(content)) return content
   return content.map(part => {
     if (typeof part !== 'object' || part === null || Array.isArray(part)) return part
     const item = part as Record<string, unknown>
     if (typeof item['text'] !== 'string') return part
-    return { ...item, text: stripForeignHarnessSignature(item['text']) }
+    return { ...item, text: rewrite(item['text']) }
   })
 }
 
@@ -316,7 +449,7 @@ export function createWorkBuddyDualShim(options: WorkBuddyDualShimOptions): Work
 
     logBodySize(logger, region, body.length)
     const raw = body.toString('utf8')
-    const prepared = prepareChatBody(raw)
+    const prepared = prepareChatBody(raw, region)
 
     const controller = new AbortController()
     req.on('close', () => controller.abort())

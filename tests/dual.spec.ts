@@ -6,7 +6,13 @@ import type { WorkBuddyModelInfo } from '../src/types.ts'
 import { normalizeReasoning } from '../src/reasoning.ts'
 import { WorkBuddyDualCatalog } from '../src/catalog.ts'
 import { defaultDesktopCandidatesFor, parseWorkBuddyAuth } from '../src/auth.ts'
-import { createWorkBuddyDualShim, prepareChatBody, stripForeignHarnessSignature } from '../src/shim.ts'
+import {
+  createWorkBuddyDualShim,
+  deflectLeadingClientIdentity,
+  prepareChatBody,
+  rewrapSystemPrompt,
+  stripForeignHarnessSignature,
+} from '../src/shim.ts'
 import { WorkBuddyDualCredentialStore } from '../src/auth.ts'
 import { WorkBuddyUpstreamClient, parseBusinessCode, parseCatalogModels, parseResetTime } from '../src/upstream.ts'
 import { WorkBuddyAccountPool } from '../src/accounts.ts'
@@ -42,6 +48,153 @@ describe('dsh-workbuddy-dual', () => {
   it('normalizes the signature across spacing and casing', () => {
     expect(stripForeignHarnessSignature('powered by deepseek   harness')).toBe('powered by DeepSeek-Harness')
     expect(stripForeignHarnessSignature('DeepSeek-Harness')).toBe('DeepSeek-Harness')
+  })
+
+  it('wraps running prose onto separate lines without changing a word', () => {
+    const prompt = 'You are a helpful assistant. Read a file before overwriting it. Prefer edit for small changes.'
+    const wrapped = rewrapSystemPrompt(prompt)
+    expect(wrapped).toBe([
+      'You are a helpful assistant.',
+      'Read a file before overwriting it.',
+      'Prefer edit for small changes.',
+    ].join('\n'))
+    // Nothing is added or removed beyond the line breaks themselves.
+    expect(wrapped.replace(/\n/gu, ' ')).toBe(prompt)
+  })
+
+  it('leaves fenced code, lists and indented blocks alone', () => {
+    const prompt = [
+      'Intro sentence. Second sentence here.',
+      '```ts',
+      'const a = 1. const b = 2.',
+      '```',
+      '- item one. item two.',
+      '    indented. second. third.',
+    ].join('\n')
+    const wrapped = rewrapSystemPrompt(prompt)
+    expect(wrapped.split('\n')).toEqual([
+      'Intro sentence.',
+      'Second sentence here.',
+      '```ts',
+      'const a = 1. const b = 2.',
+      '```',
+      '- item one. item two.',
+      '    indented. second. third.',
+    ])
+  })
+
+  it('keeps the Global system prompt exactly as the harness wrote it', () => {
+    const prompt = 'You are a helpful assistant. Read a file before overwriting it.'
+    const build = (region: 'cn' | 'global'): string => {
+      const body = JSON.stringify({
+        model: 'deepseek-v4.1-flash',
+        messages: [{ role: 'system', content: prompt }],
+      })
+      const prepared = JSON.parse(prepareChatBody(body, region)) as { messages: Array<Record<string, unknown>> }
+      return String(prepared.messages[0]?.['content'])
+    }
+    expect(build('global')).toBe(prompt)
+    expect(build('cn')).toBe([
+      'You are a helpful assistant.',
+      'Read a file before overwriting it.',
+    ].join('\n'))
+  })
+
+  it('deflects another client identity only when it opens the prompt', () => {
+    const identity = "You are Claude Code, Anthropic's official CLI for Claude."
+    expect(deflectLeadingClientIdentity(identity)).toBe("You are Claude Code — Anthropic's official CLI for Claude.")
+    // Only punctuation changes: the words and their order survive intact.
+    expect(deflectLeadingClientIdentity(identity).replace(' — ', ', ')).toBe(identity)
+    // A sentence later in the prompt is not the opening and keeps its comma.
+    expect(deflectLeadingClientIdentity(`Intro. ${identity}`)).toBe(`Intro. ${identity}`)
+    // A leading space or newline already moves the identity off the opening,
+    // and the gateway accepts those unchanged.
+    expect(deflectLeadingClientIdentity(` ${identity}`)).toBe(` ${identity}`)
+    // A truncated identity is still the same opening, so it is deflected too;
+    // the change stays a single punctuation mark in every case.
+    expect(deflectLeadingClientIdentity('You are Claude Code, Anthropic')).toBe('You are Claude Code — Anthropic')
+    // Unrelated openings are untouched.
+    expect(deflectLeadingClientIdentity('You are Claude, an AI assistant.')).toBe('You are Claude, an AI assistant.')
+    expect(deflectLeadingClientIdentity('You are Claude Code.')).toBe('You are Claude Code.')
+  })
+
+  it('rewrites a Claude Code system block on the CN lane and leaves the Global lane alone', () => {
+    const identity = "You are Claude Code, Anthropic's official CLI for Claude."
+    const build = (region: 'cn' | 'global'): unknown => {
+      const body = JSON.stringify({
+        model: 'deepseek-v4.1-flash',
+        messages: [{ role: 'system', content: [{ type: 'text', text: identity }] }],
+      })
+      const prepared = JSON.parse(prepareChatBody(body, region)) as { messages: Array<Record<string, unknown>> }
+      return prepared.messages[0]?.['content']
+    }
+    expect(build('global')).toEqual([{ type: 'text', text: identity }])
+    expect(build('cn')).toEqual([{ type: 'text', text: "You are Claude Code — Anthropic's official CLI for Claude." }])
+  })
+
+  it('types enums nested inside tool schemas so Kimi accepts the request', () => {
+    const body = JSON.stringify({
+      model: 'kimi-k3.1-pro',
+      messages: [{ role: 'user', content: 'hi' }],
+      tools: [{
+        type: 'function',
+        function: {
+          name: 'parse_visual_regions',
+          description: 'parse',
+          parameters: {
+            type: 'object',
+            properties: {
+              options: {
+                type: 'object',
+                properties: {
+                  kinds: {
+                    anyOf: [
+                      { items: { enum: ['text', 'icon'] }, type: 'array', uniqueItems: true },
+                      { type: 'null' },
+                    ],
+                  },
+                },
+              },
+            },
+          },
+        },
+      }],
+    })
+    const prepared = JSON.parse(prepareChatBody(body)) as {
+      tools: Array<{ function: { parameters: { properties: { options: { properties: { kinds: { anyOf: Array<{ items?: Record<string, unknown> }> } } } } } } }>
+    }
+    const kinds = prepared.tools[0]?.function.parameters.properties.options.properties.kinds
+    expect(kinds?.anyOf[0]?.items?.['type']).toBe('string')
+    expect(kinds?.anyOf[0]?.items?.['enum']).toEqual(['text', 'icon'])
+  })
+
+  it('leaves a declared type and heterogeneous enums alone', () => {
+    const body = JSON.stringify({
+      model: 'kimi-k3.1-pro',
+      messages: [{ role: 'user', content: 'hi' }],
+      tools: [{
+        type: 'function',
+        function: {
+          name: 'mixed',
+          description: 'mixed',
+          parameters: {
+            type: 'object',
+            properties: {
+              declared: { type: 'integer', enum: ['1', '2'] },
+              heterogeneous: { enum: ['a', 1] },
+            },
+          },
+        },
+      }],
+    })
+    const prepared = JSON.parse(prepareChatBody(body)) as {
+      tools: Array<{ function: { parameters: { properties: Record<string, Record<string, unknown>> } } }>
+    }
+    const properties = prepared.tools[0]?.function.parameters.properties
+    // An explicit type is the caller's decision and must survive verbatim.
+    expect(properties?.['declared']?.['type']).toBe('integer')
+    // No single type describes the values, so nothing is invented.
+    expect(properties?.['heterogeneous']?.['type']).toBeUndefined()
   })
 
   it('detects desktop candidates for both regions', () => {
@@ -609,14 +762,16 @@ describe('account route', () => {
           return { verdict: 'rate-limited' as const, code: '6004', resetsAtMs, elapsedMs: 1, checkedAt: Date.now() }
         },
       }
-      const { workBuddyAccountsView, createAccountRouteState } = await import('../src/account-route.ts')
+      const { workBuddyAccountsView, workBuddyAccountsRefresh, createAccountRouteState } = await import('../src/account-route.ts')
       const state = createAccountRouteState()
-      await workBuddyAccountsView({ store, client: fakeClient as never }, state)
+      // The view itself only reads cache; the refresh is what probes.
+      await workBuddyAccountsRefresh({ store, client: fakeClient as never }, state)
       expect(probes).toBe(1)
 
       // The cached verdict expired with the upstream's reset time, so the
       // next view re-checks instead of repeating a dead answer.
       resetsAtMs = Date.now() + 3_600_000
+      await workBuddyAccountsRefresh({ store, client: fakeClient as never }, state)
       const view = await workBuddyAccountsView({ store, client: fakeClient as never }, state)
       expect(probes).toBe(2)
       expect(view.cn.accounts[0]?.probe?.resetsAtMs).toBe(resetsAtMs)
@@ -660,6 +815,9 @@ describe('account route', () => {
         },
         async probeModel(_credential: unknown, model: string) {
           probes++
+          // A real probe is a network round trip; the delay is what makes the
+          // "answer from cache first" behaviour observable.
+          await new Promise(resolve => setTimeout(resolve, 30))
           return {
             verdict: 'rate-limited' as const,
             code: '6004',
@@ -680,11 +838,25 @@ describe('account route', () => {
 
       const get = await fetch(base, { headers: { host: `127.0.0.1:${address.port}` } })
       expect(get.status).toBe(200)
-      const view = (await get.json()) as { cn: { accounts: { uid: string; displayName: string; active: boolean; probe?: unknown }[]; usingFallback: boolean } }
+      const view = (await get.json()) as { cn: { accounts: { uid: string; displayName: string; active: boolean; probe?: unknown }[]; usingFallback: boolean; refreshing: boolean } }
       expect(view.cn.usingFallback).toBe(false)
       expect(view.cn.accounts[0]?.displayName).toBe('173****0329')
       expect(view.cn.accounts[0]?.active).toBe(true)
       expect(view.cn.accounts[0]?.uid).toBe('3ac06abe-657f-44f3-81a0-2bd25f3567d7')
+      // The first answer is served from cache: the row is there immediately and
+      // the lane reports that its probe is still running.
+      expect(view.cn.refreshing).toBe(true)
+
+      // Polling, which is what the panel does, ends with a real verdict.
+      let settled: typeof view | undefined
+      for (let attempt = 0; attempt < 50; attempt++) {
+        const response = await fetch(base, { headers: { host: `127.0.0.1:${address.port}` } })
+        settled = (await response.json()) as typeof view
+        if (!settled.cn.refreshing) break
+        await new Promise(resolve => setTimeout(resolve, 20))
+      }
+      expect(settled?.cn.refreshing).toBe(false)
+      expect((settled?.cn.accounts[0] as { probe?: { verdict?: string } } | undefined)?.probe?.verdict).toBe('rate-limited')
 
       const probe = await fetch(base, {
         method: 'POST',
@@ -695,14 +867,14 @@ describe('account route', () => {
       const probed = (await probe.json()) as { cn: { accounts: { probe?: { verdict: string; resetsAtMs?: number } }[] } }
       expect(probed.cn.accounts[0]?.probe?.verdict).toBe('rate-limited')
       expect(probed.cn.accounts[0]?.probe?.resetsAtMs).toBe(resetsAtMs)
-      // The first view checks each account once, so the panel opens with real
-      // verdicts; the explicit probe adds one more.
+      // One background probe for the row, plus the explicit check.
       expect(probes).toBe(2)
 
       // Within the cache window a re-open must not spend another request.
       const second = await fetch(base, { headers: { host: `127.0.0.1:${address.port}` } })
       expect(second.status).toBe(200)
       await second.json()
+      await new Promise(resolve => setTimeout(resolve, 60))
       expect(probes).toBe(2)
 
       // A non-loopback Host header must not reach the account list.
@@ -723,6 +895,123 @@ describe('account route', () => {
       expect(foreignStatus).toBe(403)
     } finally {
       await new Promise<void>(resolve => server.close(() => resolve()))
+      await fs.rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('backs off after a failed probe instead of retrying on every poll', async () => {
+    const fs = await import('node:fs/promises')
+    const os = await import('node:os')
+    const path = await import('node:path')
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'workbuddy-backoff-'))
+    try {
+      const store = new WorkBuddyDualCredentialStore({
+        refreshCN: async () => ({ accessToken: 'x' }),
+        refreshGlobal: async () => ({ accessToken: 'x' }),
+        cnPathOverride: path.join(dir, 'no-cn.info'),
+        globalPathOverride: path.join(dir, 'no-global.info'),
+        poolPaths: { cn: path.join(dir, 'cn.json'), global: path.join(dir, 'global.json') },
+      })
+      await store.poolFor('cn').upsert({
+        accessToken: 't',
+        refreshToken: 'r',
+        expiresAtMs: Date.now() + 3_600_000,
+        domain: 'www.codebuddy.cn',
+        uid: 'u1',
+        source: 'pool',
+        region: 'cn',
+      })
+
+      let probes = 0
+      const fakeClient = {
+        async fetchCredits() {
+          return { accounts: [], totalBalance: 5 }
+        },
+        async probeModel() {
+          probes++
+          throw new Error('gateway unreachable')
+        },
+      }
+      const { workBuddyAccountsView, workBuddyAccountsRefresh, createAccountRouteState } = await import('../src/account-route.ts')
+      const state = createAccountRouteState()
+      const deps = { store, client: fakeClient as never }
+
+      await workBuddyAccountsRefresh(deps, state)
+      expect(probes).toBe(1)
+      // A dead gateway must not turn every poll into another request; the row
+      // keeps the balance it could read and the next probe waits.
+      await workBuddyAccountsRefresh(deps, state)
+      await workBuddyAccountsRefresh(deps, state)
+      expect(probes).toBe(1)
+
+      const view = await workBuddyAccountsView(deps, state)
+      expect(view.cn.refreshing).toBe(false)
+      expect(view.cn.accounts[0]?.credits).toBe(5)
+      expect(view.cn.accounts[0]?.probe).toBeUndefined()
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('does not stack refreshes when the panel polls', async () => {
+    const fs = await import('node:fs/promises')
+    const os = await import('node:os')
+    const path = await import('node:path')
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'workbuddy-poll-'))
+    try {
+      const store = new WorkBuddyDualCredentialStore({
+        refreshCN: async () => ({ accessToken: 'x' }),
+        refreshGlobal: async () => ({ accessToken: 'x' }),
+        cnPathOverride: path.join(dir, 'no-cn.info'),
+        globalPathOverride: path.join(dir, 'no-global.info'),
+        poolPaths: { cn: path.join(dir, 'cn.json'), global: path.join(dir, 'global.json') },
+      })
+      for (const uid of ['a', 'b', 'c']) {
+        await store.poolFor('cn').upsert({
+          accessToken: 't',
+          refreshToken: 'r',
+          expiresAtMs: Date.now() + 3_600_000,
+          domain: 'www.codebuddy.cn',
+          uid,
+          source: 'pool',
+          region: 'cn',
+        })
+      }
+
+      let inFlight = 0
+      let peak = 0
+      let probes = 0
+      const fakeClient = {
+        async fetchCredits() {
+          inFlight++
+          peak = Math.max(peak, inFlight)
+          await new Promise(resolve => setTimeout(resolve, 20))
+          inFlight--
+          return { accounts: [], totalBalance: 5 }
+        },
+        async probeModel() {
+          probes++
+          inFlight++
+          peak = Math.max(peak, inFlight)
+          await new Promise(resolve => setTimeout(resolve, 20))
+          inFlight--
+          return { verdict: 'ok' as const, elapsedMs: 1, checkedAt: Date.now() }
+        },
+      }
+      const { workBuddyAccountsView, workBuddyAccountsRefresh, createAccountRouteState } = await import('../src/account-route.ts')
+      const state = createAccountRouteState()
+
+      // Five polls in a row, like a panel that re-reads while waiting.
+      await Promise.all(Array.from({ length: 5 }, () => workBuddyAccountsRefresh({ store, client: fakeClient as never }, state)))
+      const view = await workBuddyAccountsView({ store, client: fakeClient as never }, state)
+
+      // Three accounts, one probe each: polling must not multiply requests.
+      expect(probes).toBe(3)
+      expect(peak).toBeLessThanOrEqual(3)
+      expect(view.cn.accounts.every(account => account.probe?.verdict === 'ok')).toBe(true)
+      expect(view.cn.accounts.every(account => account.credits === 5)).toBe(true)
+      expect(view.cn.refreshing).toBe(false)
+    } finally {
       await fs.rm(dir, { recursive: true, force: true })
     }
   })
