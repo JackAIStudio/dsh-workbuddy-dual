@@ -269,8 +269,21 @@ declare class WorkBuddyDualCredentialStore {
 declare const WORKBUDDY_HEALTH_FILENAME = ".workbuddy-dual-health.json";
 interface WorkBuddyHealthEntry {
   verdict: WorkBuddyProbeVerdict;
-  /** Epoch ms after which the account may be tried again. */
+  /**
+   * Epoch ms after which the account may be tried again.
+   *
+   * Meaningless for a permanent verdict; kept so every entry has one shape.
+   */
   cooldownUntilMs: number;
+  /**
+   * The account is out for good, not for a while.
+   *
+   * A ban (`11140 request illegal`) is a gate on the account itself. There is
+   * no timer that lifts it, so putting the account back in rotation later only
+   * spends a request to learn the same answer. Only a new sign-in or an
+   * explicit re-check clears it.
+   */
+  permanent?: boolean | undefined;
   checkedAt: number;
   detail?: string | undefined;
 }
@@ -295,6 +308,8 @@ declare class WorkBuddyHealthStore {
   get documentPath(): string;
   /** Whether this account is still cooling down for this model. */
   isBlocked(region: WorkBuddyRegion, uid: string, model: string): Promise<boolean>;
+  /** Whether this account is banned for this model (or for the whole lane). */
+  isPermanent(region: WorkBuddyRegion, uid: string, model?: string | undefined): Promise<boolean>;
   get(region: WorkBuddyRegion, uid: string, model: string): Promise<WorkBuddyHealthEntry | undefined>;
   /** Every verdict that still applies, for the settings panel. */
   snapshot(): Promise<Record<string, WorkBuddyHealthEntry>>;
@@ -677,6 +692,8 @@ interface WorkBuddyWebRouting {
   order: readonly WorkBuddyWebRouteEntry[];
   /** Accounts held back by a cooldown, soonest recovery first. */
   blocked: readonly WorkBuddyWebRouteEntry[];
+  /** Accounts that are out for good (banned); never tried, never waited on. */
+  disabled: readonly WorkBuddyWebRouteEntry[];
   /** Epoch ms when the earliest blocked account frees up. */
   nextRecoveryMs?: number | undefined;
 }
@@ -687,6 +704,14 @@ interface WorkBuddyDualAccountRouteOptions {
   client: WorkBuddyUpstreamClient;
   /** Rebuild catalogs and notify pickers after the active account changes. */
   onAccountChange?: ((region: WorkBuddyRegion) => void | Promise<void>) | undefined;
+  /**
+   * Accounts that are out for good.
+   *
+   * A banned sign-in is not a temporary state, so the panel must stop probing
+   * it: every automatic check spends a request to re-learn `11140`, and a
+   * permanent verdict would otherwise be overwritten by the next sweep.
+   */
+  isDisabled?: ((region: WorkBuddyRegion, uid: string, model: string) => Promise<boolean>) | undefined;
   /** The automatic-switching preference and the route it produces. */
   router?: {
     settings: () => boolean;
@@ -704,6 +729,7 @@ interface WorkBuddyDualAccountRouteOptions {
     order: () => Promise<{
       order: readonly WorkBuddyWebRouteEntry[];
       blocked: readonly WorkBuddyWebRouteEntry[];
+      disabled: readonly WorkBuddyWebRouteEntry[];
       nextRecoveryMs?: number | undefined;
     }>;
   } | undefined;
@@ -723,6 +749,14 @@ interface WorkBuddyAccountRouteState {
   probes: Map<string, CachedProbe>;
   /** Called with every fresh probe verdict, so the router sees it too. */
   onProbe?: ((region: WorkBuddyRegion, uid: string, model: string, probe: WorkBuddyWebProbe) => void | Promise<void>) | undefined;
+  /**
+   * Accounts that are out for good.
+   *
+   * A banned sign-in is not a temporary state, so the panel must stop probing
+   * it: every automatic check spends a request to re-learn `11140`, and a
+   * permanent verdict would otherwise be overwritten by the next sweep.
+   */
+  isDisabled?: ((region: WorkBuddyRegion, uid: string, model: string) => Promise<boolean>) | undefined;
   /** One in-flight background refresh per lane, so polling cannot stack them. */
   refreshing: Map<WorkBuddyRegion, Promise<void>>;
   /** Lanes asked to refresh again as soon as the current pass finishes. */

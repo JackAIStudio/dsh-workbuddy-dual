@@ -285,6 +285,18 @@ export interface WorkBuddyRouteOverviewEntry {
   blocked?: string | undefined
 }
 
+export interface WorkBuddyRouteOverview {
+  order: WorkBuddyRouteOverviewEntry[]
+  /** Cooling down for now; they come back without anyone doing anything. */
+  blocked: WorkBuddyRouteOverviewEntry[]
+  /**
+   * Out for good. A ban is not a wait, so these never appear in `order`, never
+   * count as "next account", and are not the reason a request waits.
+   */
+  disabled: WorkBuddyRouteOverviewEntry[]
+  nextRecoveryMs?: number | undefined
+}
+
 /**
  * The order a flash request would try accounts in, plus who is held back.
  *
@@ -296,7 +308,7 @@ export async function routeOverview(
   options: WorkBuddyRouterOptions,
   model: string,
   sessionKey?: string | undefined,
-): Promise<{ order: WorkBuddyRouteOverviewEntry[]; blocked: WorkBuddyRouteOverviewEntry[]; nextRecoveryMs?: number }> {
+): Promise<WorkBuddyRouteOverview> {
   const all: WorkBuddyRouteCandidate[] = []
   for (const region of REGION_ORDER) {
     if (options.hasModel !== undefined && !options.hasModel(region, model)) continue
@@ -306,9 +318,20 @@ export async function routeOverview(
 
   const snapshot = await options.health.snapshot()
   const blocked: WorkBuddyRouteOverviewEntry[] = []
+  const disabled: WorkBuddyRouteOverviewEntry[] = []
   for (const candidate of all) {
     const entry = snapshot[healthKeyOf(candidate.region, candidate.uid, model)]
-    if (entry === undefined || entry.cooldownUntilMs <= Date.now()) continue
+    if (entry === undefined) continue
+    if (entry.permanent === true) {
+      disabled.push({
+        region: candidate.region,
+        uid: candidate.uid,
+        displayName: candidate.label,
+        blocked: entry.verdict,
+      })
+      continue
+    }
+    if (entry.cooldownUntilMs <= Date.now()) continue
     blocked.push({
       region: candidate.region,
       uid: candidate.uid,
@@ -331,6 +354,7 @@ export async function routeOverview(
   return {
     order,
     blocked,
+    disabled,
     ...(earliest === undefined ? {} : { nextRecoveryMs: earliest }),
   }
 }

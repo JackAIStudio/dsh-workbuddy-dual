@@ -49,6 +49,14 @@ export interface WorkBuddyDualAccountRouteOptions {
   client: WorkBuddyUpstreamClient
   /** Rebuild catalogs and notify pickers after the active account changes. */
   onAccountChange?: ((region: WorkBuddyRegion) => void | Promise<void>) | undefined
+  /**
+   * Accounts that are out for good.
+   *
+   * A banned sign-in is not a temporary state, so the panel must stop probing
+   * it: every automatic check spends a request to re-learn `11140`, and a
+   * permanent verdict would otherwise be overwritten by the next sweep.
+   */
+  isDisabled?: ((region: WorkBuddyRegion, uid: string, model: string) => Promise<boolean>) | undefined
   /** The automatic-switching preference and the route it produces. */
   router?: {
     settings: () => boolean
@@ -66,6 +74,7 @@ export interface WorkBuddyDualAccountRouteOptions {
     order: () => Promise<{
       order: readonly WorkBuddyWebRouteEntry[]
       blocked: readonly WorkBuddyWebRouteEntry[]
+      disabled: readonly WorkBuddyWebRouteEntry[]
       nextRecoveryMs?: number | undefined
     }>
   } | undefined
@@ -212,6 +221,14 @@ export interface WorkBuddyAccountRouteState {
   probes: Map<string, CachedProbe>
   /** Called with every fresh probe verdict, so the router sees it too. */
   onProbe?: ((region: WorkBuddyRegion, uid: string, model: string, probe: WorkBuddyWebProbe) => void | Promise<void>) | undefined
+  /**
+   * Accounts that are out for good.
+   *
+   * A banned sign-in is not a temporary state, so the panel must stop probing
+   * it: every automatic check spends a request to re-learn `11140`, and a
+   * permanent verdict would otherwise be overwritten by the next sweep.
+   */
+  isDisabled?: ((region: WorkBuddyRegion, uid: string, model: string) => Promise<boolean>) | undefined
   /** One in-flight background refresh per lane, so polling cannot stack them. */
   refreshing: Map<WorkBuddyRegion, Promise<void>>
   /** Lanes asked to refresh again as soon as the current pass finishes. */
@@ -447,19 +464,26 @@ async function regionView(
     // Busy means "a request is still outstanding", not "a pass is scheduled":
     // a pass that finds everything cached makes no requests, and reporting it
     // would keep the panel polling forever for nothing.
-    refreshing: state.refreshing.has(region) && regionHasPendingWork(state, region, doc, fallbackCredential),
+    refreshing: state.refreshing.has(region) && await regionHasPendingWork(state, region, doc, fallbackCredential),
   }
 }
 
 /** Whether any sign-in in this lane still needs a network round trip. */
-function regionHasPendingWork(
+async function regionHasPendingWork(
   state: WorkBuddyAccountRouteState,
   region: WorkBuddyRegion,
   doc: { accounts: readonly WorkBuddyPoolAccount[] },
   fallbackCredential: WorkBuddyCredential | undefined,
-): boolean {
-  if (fallbackCredential !== undefined && needsWork(state, fallbackCredential)) return true
-  return doc.accounts.some(account => needsWork(state, toCredential(account)))
+): Promise<boolean> {
+  const pending = async (credential: WorkBuddyCredential): Promise<boolean> => {
+    if (!needsWork(state, credential)) return false
+    return await state.isDisabled?.(credential.region, credential.uid, WORKBUDDY_FLASH_MODEL) !== true
+  }
+  if (fallbackCredential !== undefined && await pending(fallbackCredential)) return true
+  for (const account of doc.accounts) {
+    if (await pending(toCredential(account))) return true
+  }
+  return false
 }
 
 /**
@@ -481,6 +505,10 @@ async function refreshRegion(
 
   const fill = async (credential: WorkBuddyCredential): Promise<void> => {
     try {
+      // A banned account has nothing left to learn; checking it again only
+      // spends a request and risks replacing a permanent verdict with a
+      // transient one.
+      if (await state.isDisabled?.(credential.region, credential.uid, WORKBUDDY_FLASH_MODEL) === true) return
       await creditsFor(state, deps.client, credential)
       const probeKey = cacheKey(credential.region, credential.uid, WORKBUDDY_FLASH_MODEL)
       if (probeFor(state, credential, WORKBUDDY_FLASH_MODEL) === undefined && !failedRecently(state, probeKey)) {
@@ -559,7 +587,7 @@ export async function workBuddyAccountsView(
   const autoRoute = deps.router?.settings() ?? false
   const routing: WorkBuddyWebRouting = {
     model: WORKBUDDY_FLASH_MODEL,
-    ...(await deps.router?.order().catch(() => ({ order: [], blocked: [] })) ?? { order: [], blocked: [] }),
+    ...(await deps.router?.order().catch(() => ({ order: [], blocked: [], disabled: [] })) ?? { order: [], blocked: [], disabled: [] }),
   }
   return { cn, global, autoRoute, routing }
 }
@@ -743,6 +771,7 @@ export function registerWorkBuddyDualAccountRoutes(ctx: Context, deps: WorkBuddy
   state.onProbe = async (region, uid, model, probe) => {
     await deps.router?.record(region, uid, model, probe)
   }
+  state.isDisabled = deps.isDisabled
   ctx.effect(() => {
     const dispose = ctx.webServer.register({
       kind: 'exact',

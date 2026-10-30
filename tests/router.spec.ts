@@ -240,6 +240,29 @@ describe('automatic account routing', () => {
     expect(Object.keys(doc.entries)).toEqual([healthKey('cn', 'cn-a', FLASH)])
   })
 
+  it('reads a ban written before the permanent flag as permanent', async () => {
+    // Older builds stored a ban with a 24-hour cooldown and no flag. Upgrading
+    // must not hand that account back to the router when the cooldown expires.
+    const fs = await import('node:fs/promises')
+    const path = join(dir, 'legacy-health.json')
+    await fs.writeFile(path, JSON.stringify({
+      version: 1,
+      entries: {
+        [healthKey('global', 'old-ban', FLASH)]: {
+          verdict: 'banned',
+          cooldownUntilMs: Date.now() + 3_600_000,
+          checkedAt: Date.now() - 1_000,
+        },
+      },
+      updatedAt: Date.now(),
+    }))
+    const health = new WorkBuddyHealthStore({ path })
+    expect(await health.isPermanent('global', 'old-ban', FLASH)).toBe(true)
+    // Even well past the stale cooldown, the ban still holds.
+    const later = new WorkBuddyHealthStore({ path, now: () => Date.now() + 30 * 24 * 3_600_000 })
+    expect(await later.isBlocked('global', 'old-ban', FLASH)).toBe(true)
+  })
+
   it('never shortens an existing block with a second bare 429', async () => {
     const health = new WorkBuddyHealthStore({ path: join(dir, 'health.json') })
     const long = Date.now() + 7_200_000
@@ -449,10 +472,29 @@ describe('failure classification', () => {
     expect(verdictForFailure('auth', 'token expired')).toBe('auth')
   })
 
-  it('keeps a banned account out of rotation far longer than an expired sign-in', async () => {
-    const now = Date.now()
-    const banned = cooldownFor('banned', undefined, now) - now
-    const expired = cooldownFor('auth', undefined, now) - now
-    expect(banned).toBeGreaterThan(expired * 10)
+  it('keeps a banned account out of rotation for good', async () => {
+    const health = new WorkBuddyHealthStore({ path: join(dir, 'health.json') })
+    const store = await buildStore()
+    await store.poolFor('global').upsert(credential('global', 'banned-a'))
+    await health.record('global', 'banned-a', FLASH, 'banned')
+
+    // No timer brings it back: the gateway's ban is not a cooldown.
+    expect(await health.isBlocked('global', 'banned-a', FLASH)).toBe(true)
+    expect(await health.isPermanent('global', 'banned-a', FLASH)).toBe(true)
+
+    // A day later it is still out, unlike a rate limit.
+    const later = new WorkBuddyHealthStore({
+      path: join(dir, 'health.json'),
+      now: () => Date.now() + 7 * 24 * 3_600_000,
+    })
+    expect(await later.isBlocked('global', 'banned-a', FLASH)).toBe(true)
+
+    // It is not counted as "recovering soon", so a request will not wait on it.
+    const overview = await routeOverview(
+      { store, client: { refreshToken: async () => ({ accessToken: 'x' }) } as never, health },
+      FLASH,
+    )
+    expect(overview.blocked.map(e => e.uid)).not.toContain('banned-a')
+    expect(overview.disabled.map(e => e.uid)).toContain('banned-a')
   })
 })

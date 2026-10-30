@@ -63,7 +63,9 @@ function probeLabel(probe: WorkBuddyWebProbe | undefined, t: Translate): string 
     case 'rate-limited': return probe.resetsAtMs === undefined
       ? `⛔ ${t('probeRateLimitedNoTime')}`
       : `⛔ ${t('probeRateLimited', { time: formatReset(probe.resetsAtMs) })}`
-    case 'banned': return `⛔ ${t('probeBanned')}`
+    // A ban is not a wait: the account is out of rotation entirely, so the
+    // label says so instead of showing a cooldown that will never end.
+    case 'banned': return `🚫 ${t('probeBanned')}`
     case 'no-credit': return `⛔ ${t('probeNoCredit')}`
     case 'auth': return `⛔ ${t('probeAuth')}`
     case 'error': return `⚠️ ${t('probeError')}`
@@ -480,6 +482,22 @@ export function WorkBuddyAccountList({ t }: { t: Translate }) {
                 </span>
               </div>
             ))}
+            {routing.disabled.length > 0 && (
+              <div style={{ fontSize: 11.5, display: 'flex', flexDirection: 'column', gap: 2, marginTop: 2 }}>
+                <span style={{ fontWeight: 600, color: 'var(--text-secondary, #6b7280)' }}>
+                  {t('routingDisabledTitle')}
+                </span>
+                {routing.disabled.map(entry => (
+                  <div key={`disabled-${entry.region}/${entry.uid}`} style={{ display: 'flex', gap: 6, color: '#9ca3af' }}>
+                    <span>{entry.region === 'cn' ? '🇨🇳' : '🌍'} {entry.displayName}</span>
+                    <span>{t('routingDisabled', { reason: entry.blocked ?? t('probeBanned') })}</span>
+                  </div>
+                ))}
+                <span style={{ fontSize: 11, color: 'var(--text-secondary, #6b7280)' }}>
+                  {t('routingDisabledHint')}
+                </span>
+              </div>
+            )}
             {routing.nextRecoveryMs !== undefined && (
               <div style={{ fontSize: 11, color: '#f59e0b' }}>
                 {t('routingRecovery', { time: formatReset(routing.nextRecoveryMs) })}

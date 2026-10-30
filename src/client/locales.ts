@@ -85,6 +85,9 @@ export const en = {
   routingBlocked: 'cooling down · {time}',
   routingRecovery: 'Earliest recovery: {time}',
   routingInUse: 'this conversation is on it',
+  routingDisabled: 'disabled · {reason}',
+  routingDisabledTitle: 'Disabled accounts',
+  routingDisabledHint: 'Banned accounts are not retried and never delay a request.',
 } as const
 
 export type WorkBuddyDualSettingsKey = keyof typeof en
@@ -176,4 +179,7 @@ export const zh: Record<WorkBuddyDualSettingsKey, string> = {
   routingBlocked: '冷却中 · {time}',
   routingRecovery: '最早恢复：{time}',
   routingInUse: '本对话正在用它',
+  routingDisabled: '已停用 · {reason}',
+  routingDisabledTitle: '已停用的账号',
+  routingDisabledHint: '封禁账号不会再重试，也不会拖慢请求。',
 }

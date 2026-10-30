@@ -25,20 +25,24 @@ export const WORKBUDDY_HEALTH_FILENAME = '.workbuddy-dual-health.json'
 const RATE_LIMIT_COOLDOWN_MS = 60_000
 const CREDIT_COOLDOWN_MS = 10 * 60_000
 const AUTH_COOLDOWN_MS = 30 * 60_000
-/**
- * A banned account does not come back on a timer.
- *
- * `11140 request illegal` is a gate on the account itself; retrying it every
- * half hour spends a request to learn the same thing. Keep it out of rotation
- * for a day, long enough that only a deliberate re-check or a new sign-in
- * brings it back.
- */
-const BANNED_COOLDOWN_MS = 24 * 60 * 60_000
 
 export interface WorkBuddyHealthEntry {
   verdict: WorkBuddyProbeVerdict
-  /** Epoch ms after which the account may be tried again. */
+  /**
+   * Epoch ms after which the account may be tried again.
+   *
+   * Meaningless for a permanent verdict; kept so every entry has one shape.
+   */
   cooldownUntilMs: number
+  /**
+   * The account is out for good, not for a while.
+   *
+   * A ban (`11140 request illegal`) is a gate on the account itself. There is
+   * no timer that lifts it, so putting the account back in rotation later only
+   * spends a request to learn the same answer. Only a new sign-in or an
+   * explicit re-check clears it.
+   */
+  permanent?: boolean | undefined
   checkedAt: number
   detail?: string | undefined
 }
@@ -71,7 +75,8 @@ export function cooldownFor(
     }
     case 'no-credit': return now + CREDIT_COOLDOWN_MS
     case 'auth': return now + AUTH_COOLDOWN_MS
-    case 'banned': return now + BANNED_COOLDOWN_MS
+    // A ban has no reset moment; callers must honour `permanent` instead.
+    case 'banned': return now
     case 'error': return now + RATE_LIMIT_COOLDOWN_MS
     case 'ok': return now
   }
@@ -106,7 +111,16 @@ export class WorkBuddyHealthStore {
   async isBlocked(region: WorkBuddyRegion, uid: string, model: string): Promise<boolean> {
     const entry = await this.get(region, uid, model)
     if (entry === undefined) return false
+    if (entry.permanent === true) return true
     return entry.cooldownUntilMs > this.now()
+  }
+
+  /** Whether this account is banned for this model (or for the whole lane). */
+  async isPermanent(region: WorkBuddyRegion, uid: string, model?: string | undefined): Promise<boolean> {
+    await this.load()
+    if (model !== undefined) return this.entries[healthKey(region, uid, model)]?.permanent === true
+    const prefix = `${region}/${uid}/`
+    return Object.keys(this.entries).some(key => key.startsWith(prefix) && this.entries[key]?.permanent === true)
   }
 
   async get(region: WorkBuddyRegion, uid: string, model: string): Promise<WorkBuddyHealthEntry | undefined> {
@@ -120,7 +134,7 @@ export class WorkBuddyHealthStore {
     const now = this.now()
     const live: Record<string, WorkBuddyHealthEntry> = {}
     for (const [key, entry] of Object.entries(this.entries)) {
-      if (entry.cooldownUntilMs > now) live[key] = entry
+      if (entry.permanent === true || entry.cooldownUntilMs > now) live[key] = entry
     }
     return live
   }
@@ -148,6 +162,17 @@ export class WorkBuddyHealthStore {
       return
     }
     const previous = this.entries[key]
+    if (verdict === 'banned') {
+      this.entries[key] = {
+        verdict,
+        cooldownUntilMs: now,
+        permanent: true,
+        checkedAt: now,
+        ...(extra.detail === undefined ? {} : { detail: extra.detail }),
+      }
+      await this.flush()
+      return
+    }
     const cooldownUntilMs = cooldownFor(verdict, extra.resetsAtMs, now)
     // Never shorten an existing block: a second 429 that reports no reset time
     // must not turn a two-hour limit into a one-minute one.
@@ -156,6 +181,7 @@ export class WorkBuddyHealthStore {
       verdict,
       cooldownUntilMs: merged,
       checkedAt: now,
+      ...(previous?.permanent === true ? { permanent: true } : {}),
       ...(extra.detail === undefined ? {} : { detail: extra.detail }),
     }
     await this.flush()
@@ -218,15 +244,22 @@ export function normalizeEntries(raw: unknown, now: number): Record<string, Work
     const entry = value as Record<string, unknown>
     const verdict = entry['verdict']
     if (verdict !== 'rate-limited' && verdict !== 'banned' && verdict !== 'no-credit' && verdict !== 'auth' && verdict !== 'error') continue
+    // Any stored ban is permanent, including entries written before the flag
+    // existed: those carried a 24-hour cooldown that must not resurrect the
+    // account. The verdict is the gateway's own answer, so it is authoritative.
+    const permanent = verdict === 'banned'
     const cooldownUntilMs = entry['cooldownUntilMs']
-    if (typeof cooldownUntilMs !== 'number' || !Number.isFinite(cooldownUntilMs)) continue
-    if (cooldownUntilMs <= now) continue
+    if (!permanent) {
+      if (typeof cooldownUntilMs !== 'number' || !Number.isFinite(cooldownUntilMs)) continue
+      if (cooldownUntilMs <= now) continue
+    }
     const checkedAt = typeof entry['checkedAt'] === 'number' ? entry['checkedAt'] : now
     const detail = typeof entry['detail'] === 'string' ? entry['detail'] : undefined
     out[key] = {
       verdict,
-      cooldownUntilMs,
+      cooldownUntilMs: typeof cooldownUntilMs === 'number' && Number.isFinite(cooldownUntilMs) ? cooldownUntilMs : now,
       checkedAt,
+      ...(permanent ? { permanent: true } : {}),
       ...(detail === undefined ? {} : { detail }),
     }
   }

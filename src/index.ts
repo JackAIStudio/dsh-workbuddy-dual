@@ -196,6 +196,9 @@ export function apply(ctx: Context, config: WorkBuddyDualConfig = {}): void {
     registerWorkBuddyDualAccountRoutes(webCtx, {
       store,
       client,
+      // The panel's background sweep skips banned accounts: there is nothing
+      // left to check, and each attempt would spend a request on `11140`.
+      isDisabled: (region, uid, model) => health.isPermanent(region, uid, model),
       router: {
         settings: () => routerSettings.current().autoRoute,
         setAutoRoute: async (enabled: boolean) => (await routerSettings.set({ autoRoute: enabled })).autoRoute,

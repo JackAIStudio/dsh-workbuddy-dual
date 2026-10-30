@@ -92,6 +92,8 @@ export interface WorkBuddyWebRouting {
   order: readonly WorkBuddyWebRouteEntry[]
   /** Accounts held back by a cooldown, soonest recovery first. */
   blocked: readonly WorkBuddyWebRouteEntry[]
+  /** Accounts that are out for good (banned); never tried, never waited on. */
+  disabled: readonly WorkBuddyWebRouteEntry[]
   /** Epoch ms when the earliest blocked account frees up. */
   nextRecoveryMs?: number | undefined
 }
