@@ -22,6 +22,15 @@ import type { WorkBuddyModelInfo, WorkBuddyRegion } from './types.ts'
 export const WORKBUDDY_CN_PROVIDER = 'workbuddy-cn'
 export const WORKBUDDY_GLOBAL_PROVIDER = 'workbuddy-global'
 
+/**
+ * Picker name of the CN route.
+ *
+ * It is no longer only CN: the route now spends CN accounts first and reaches
+ * for Global when every CN account is cooling down, so the old "WorkBuddy CN"
+ * label would describe only half of what a request may do.
+ */
+export const WORKBUDDY_CN_DISPLAY_NAME = 'WorkBuddy（国内优先）'
+
 export const WORKBUDDY_STREAM_IDLE_TIMEOUT_MS = 300_000
 
 /**
@@ -173,6 +182,10 @@ function toPiModel(info: WorkBuddyModelInfo, baseUrl: string, providerId: string
     provider: providerId,
     baseUrl,
     input: info.supportsImages === true ? ['text', 'image'] : ['text'],
+    // Ask pi-ai to stamp the harness session id on every request. The shim
+    // routes by that id, so one conversation keeps one account even though each
+    // step arrives as a separate HTTP call.
+    ...({ compat: { sendSessionAffinityHeaders: true, sessionAffinityFormat: 'openai' } } as any),
     ...reasoningFields(info),
     cost: NO_COST,
     contextWindow: info.contextWindow,
@@ -231,12 +244,12 @@ export function createWorkBuddyDualAdapter(options: WorkBuddyDualAdapterOptions)
   }
 
   const buildProfiles = (): Map<string, ResolvedPiAiProviderProfile> => {
-    const cnProvider = createProviderFor('cn', WORKBUDDY_CN_PROVIDER, 'WorkBuddy CN')
+    const cnProvider = createProviderFor('cn', WORKBUDDY_CN_PROVIDER, WORKBUDDY_CN_DISPLAY_NAME)
     const globalProvider = createProviderFor('global', WORKBUDDY_GLOBAL_PROVIDER, 'WorkBuddy Global')
 
     const cnProfile: ResolvedPiAiProviderProfile = {
       provider: WORKBUDDY_CN_PROVIDER,
-      displayName: 'WorkBuddy CN',
+      displayName: WORKBUDDY_CN_DISPLAY_NAME,
       streamIdleTimeoutMs: WORKBUDDY_STREAM_IDLE_TIMEOUT_MS,
       retryPolicy: resolveRetryPolicy(undefined, 'dsh-workbuddy-dual CN retryPolicy'),
       configuredMaxTokens: new Map(),

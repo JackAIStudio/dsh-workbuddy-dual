@@ -27,6 +27,8 @@ import {
   type WorkBuddyWebAccounts,
   type WorkBuddyWebProbe,
   type WorkBuddyWebRegionAccounts,
+  type WorkBuddyWebRouteEntry,
+  type WorkBuddyWebRouting,
 } from './account-paths.ts'
 import type { WorkBuddyCredential, WorkBuddyRegion } from './types.ts'
 import type { WorkBuddyUpstreamClient } from './upstream.ts'
@@ -47,6 +49,26 @@ export interface WorkBuddyDualAccountRouteOptions {
   client: WorkBuddyUpstreamClient
   /** Rebuild catalogs and notify pickers after the active account changes. */
   onAccountChange?: ((region: WorkBuddyRegion) => void | Promise<void>) | undefined
+  /** The automatic-switching preference and the route it produces. */
+  router?: {
+    settings: () => boolean
+    setAutoRoute: (enabled: boolean) => Promise<boolean>
+    /**
+     * Persist a probe verdict for routing.
+     *
+     * The panel's probe is a real one-token request, so its answer is exactly
+     * what the router needs. Without this the panel could show "limited until
+     * 07:28" while the router still handed the next turn to that same account
+     * and only learned about the limit by failing.
+     */
+    record: (region: WorkBuddyRegion, uid: string, model: string, probe: WorkBuddyWebProbe) => Promise<void>
+    /** Accounts in the order the next flash request would try them. */
+    order: () => Promise<{
+      order: readonly WorkBuddyWebRouteEntry[]
+      blocked: readonly WorkBuddyWebRouteEntry[]
+      nextRecoveryMs?: number | undefined
+    }>
+  } | undefined
 }
 
 interface CachedCredits {
@@ -188,6 +210,8 @@ async function usableCredential(
 export interface WorkBuddyAccountRouteState {
   credits: Map<string, CachedCredits>
   probes: Map<string, CachedProbe>
+  /** Called with every fresh probe verdict, so the router sees it too. */
+  onProbe?: ((region: WorkBuddyRegion, uid: string, model: string, probe: WorkBuddyWebProbe) => void | Promise<void>) | undefined
   /** One in-flight background refresh per lane, so polling cannot stack them. */
   refreshing: Map<WorkBuddyRegion, Promise<void>>
   /** Lanes asked to refresh again as soon as the current pass finishes. */
@@ -356,6 +380,9 @@ async function probeAccount(
     }
     state.probes.set(key, { probe, at: Date.now() })
     state.failures.delete(key)
+    // Feed the verdict to the router so a check the user just ran changes the
+    // very next request instead of only repainting the row.
+    await state.onProbe?.(credential.region, credential.uid, model, probe)
     return probe
   } catch (error: unknown) {
     state.failures.set(key, Date.now())
@@ -529,7 +556,12 @@ export async function workBuddyAccountsView(
     regionView('cn', deps, state),
     regionView('global', deps, state),
   ])
-  return { cn, global }
+  const autoRoute = deps.router?.settings() ?? false
+  const routing: WorkBuddyWebRouting = {
+    model: WORKBUDDY_FLASH_MODEL,
+    ...(await deps.router?.order().catch(() => ({ order: [], blocked: [] })) ?? { order: [], blocked: [] }),
+  }
+  return { cn, global, autoRoute, routing }
 }
 
 /**
@@ -590,6 +622,11 @@ export function parseAccountAction(value: unknown): WorkBuddyAccountAction {
         ...(model === undefined || model.trim() === '' ? {} : { model: model.trim() }),
       }
     }
+    case 'autoroute': {
+      const enabled = value['enabled']
+      if (typeof enabled !== 'boolean') throw new Error('enabled must be a boolean')
+      return { action: 'autoroute', enabled }
+    }
     default:
       throw new Error('unknown action')
   }
@@ -601,6 +638,11 @@ async function applyAction(
   state: WorkBuddyAccountRouteState,
   action: WorkBuddyAccountAction,
 ): Promise<WorkBuddyWebAccounts> {
+  if (action.action === 'autoroute') {
+    await deps.router?.setAutoRoute(action.enabled)
+    return await workBuddyAccountsView(deps, state)
+  }
+
   const pool = deps.store.poolFor(action.region)
 
   switch (action.action) {
@@ -698,6 +740,9 @@ export function workBuddyAccountHandler(
 /** Mount the same-origin account routes; safe on both Web and desktop hosts. */
 export function registerWorkBuddyDualAccountRoutes(ctx: Context, deps: WorkBuddyDualAccountRouteOptions): void {
   const state = createAccountRouteState()
+  state.onProbe = async (region, uid, model, probe) => {
+    await deps.router?.record(region, uid, model, probe)
+  }
   ctx.effect(() => {
     const dispose = ctx.webServer.register({
       kind: 'exact',

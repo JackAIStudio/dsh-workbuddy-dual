@@ -265,6 +265,55 @@ declare class WorkBuddyDualCredentialStore {
   poolFor(region: WorkBuddyRegion): WorkBuddyAccountPool;
 }
 //#endregion
+//#region src/health.d.ts
+declare const WORKBUDDY_HEALTH_FILENAME = ".workbuddy-dual-health.json";
+interface WorkBuddyHealthEntry {
+  verdict: WorkBuddyProbeVerdict;
+  /** Epoch ms after which the account may be tried again. */
+  cooldownUntilMs: number;
+  checkedAt: number;
+  detail?: string | undefined;
+}
+declare function healthKey(region: WorkBuddyRegion, uid: string, model: string): string;
+/** How long a verdict keeps an account out of rotation. */
+declare function cooldownFor(verdict: WorkBuddyProbeVerdict, resetsAtMs: number | undefined, now?: number): number;
+interface WorkBuddyHealthStoreOptions {
+  path?: string | undefined;
+  now?: (() => number) | undefined;
+}
+/** Reads and writes the availability document with atomic replacement. */
+declare class WorkBuddyHealthStore {
+  private readonly path;
+  private readonly now;
+  private entries;
+  private loaded;
+  private loading;
+  /** Serializes writes so two fast verdicts cannot interleave a whole file. */
+  private writing;
+  constructor(options?: WorkBuddyHealthStoreOptions);
+  /** Absolute document path; diagnostics only. */
+  get documentPath(): string;
+  /** Whether this account is still cooling down for this model. */
+  isBlocked(region: WorkBuddyRegion, uid: string, model: string): Promise<boolean>;
+  get(region: WorkBuddyRegion, uid: string, model: string): Promise<WorkBuddyHealthEntry | undefined>;
+  /** Every verdict that still applies, for the settings panel. */
+  snapshot(): Promise<Record<string, WorkBuddyHealthEntry>>;
+  /**
+   * Remember what the gateway just said about this account and model.
+   *
+   * `ok` clears a stored cooldown, which is how an account rejoins rotation
+   * after a successful retry instead of waiting for its timer to run out.
+   */
+  record(region: WorkBuddyRegion, uid: string, model: string, verdict: WorkBuddyProbeVerdict, extra?: {
+    resetsAtMs?: number | undefined;
+    detail?: string | undefined;
+  }): Promise<void>;
+  /** Forget one account's verdicts, e.g. after a manual re-check or sign-in. */
+  clear(region: WorkBuddyRegion, uid?: string): Promise<void>;
+  private flush;
+  private load;
+}
+//#endregion
 //#region src/upstream.d.ts
 type UpstreamErrorKind = 'auth' | 'credit' | 'rate' | 'client' | 'server' | 'not_found';
 type WorkBuddyChatResult = {
@@ -296,6 +345,75 @@ declare class WorkBuddyUpstreamClient {
   fetchCredits(credential: WorkBuddyCredential): Promise<WorkBuddyCredits>;
 }
 //#endregion
+//#region src/router.d.ts
+/** Regions in the order the router tries them. */
+declare const REGION_ORDER: readonly WorkBuddyRegion[];
+interface WorkBuddyRouteCandidate {
+  region: WorkBuddyRegion;
+  uid: string;
+  credential: WorkBuddyCredential;
+  /** `fallback` is the WorkBuddy app's own sign-in rather than a pool entry. */
+  source: 'pool' | 'fallback';
+  label: string;
+  credits?: number | undefined;
+}
+interface WorkBuddyRouteRequest {
+  model: string;
+  /** Stable per conversation; the chosen account sticks to it. */
+  sessionKey?: string | undefined;
+  /** Accounts that already failed this request and must not be retried. */
+  exclude?: ReadonlySet<string> | undefined;
+  /** Restrict to one region (`model` only exists there, or the user pinned it). */
+  region?: WorkBuddyRegion | undefined;
+  /**
+   * Renew a token that is about to expire.
+   *
+   * The request path wants this, because a stale token is a failed turn. The
+   * settings panel does not: it polls the account view every second or so, and
+   * a refresh there would make the panel wait on the network for a verdict it
+   * is only describing.
+   */
+  refreshTokens?: boolean | undefined;
+}
+interface WorkBuddyRouterOptions {
+  store: WorkBuddyDualCredentialStore;
+  client: WorkBuddyUpstreamClient;
+  health: WorkBuddyHealthStore;
+  /** Last known credit balance per `region/uid`; the panel keeps these warm. */
+  credits?: ((region: WorkBuddyRegion, uid: string) => number | undefined) | undefined;
+  /**
+   * Whether this lane's catalog offers the model at all.
+   *
+   * Crossing lanes is only useful for models both gateways serve — Flash is on
+   * both. A CN-only model (Kimi) has no Global equivalent, and sending it there
+   * would trade a rate limit for an unknown model error.
+   */
+  hasModel?: ((region: WorkBuddyRegion, model: string) => boolean) | undefined;
+  now?: (() => number) | undefined;
+}
+type CandidateKey = string;
+declare function candidateKey(region: WorkBuddyRegion, uid: string): CandidateKey;
+/** The account this session already used, held across turns of one conversation. */
+declare class WorkBuddySessionAffinity {
+  private readonly chosen;
+  private readonly lastUsed;
+  get(sessionKey: string | undefined): CandidateKey | undefined;
+  remember(sessionKey: string | undefined, region: WorkBuddyRegion, uid: string): void;
+  forget(sessionKey: string | undefined): void;
+  markUsed(region: WorkBuddyRegion, uid: string): void;
+  lastUsedMap(): Map<CandidateKey, number>;
+}
+/**
+ * Ordered candidates for one request: [this session's account, then the rest].
+ *
+ * Blocked accounts are dropped only from the `available` list; the plan still
+ * records them so the caller can say when the account that was blocked is free
+ * again instead of reporting a bare "no account".
+ */
+declare function planRoute(options: WorkBuddyRouterOptions, affinity: WorkBuddySessionAffinity, request: WorkBuddyRouteRequest): Promise<WorkBuddyRouteCandidate[]>;
+/** Earliest moment any blocked lane account becomes usable, for the UI/message. */
+declare function nextRecoveryMs(options: WorkBuddyRouterOptions, model: string, region?: WorkBuddyRegion | undefined): Promise<number | undefined>;
+//#endregion
 //#region src/shim.d.ts
 interface WorkBuddyDualShim {
   readonly origin: string;
@@ -311,12 +429,39 @@ interface WorkBuddyDualShimOptions {
     info: (msg: string, ...args: unknown[]) => void;
     error: (msg: string, ...args: unknown[]) => void;
   };
+  /**
+   * Automatic account routing. Omit it to keep the single selected account per
+   * lane, which is what the unit tests that predate routing rely on.
+   */
+  route?: WorkBuddyRouteOptions | undefined;
+}
+interface WorkBuddyRouteOptions {
+  router: WorkBuddyRouterOptions;
+  affinity: WorkBuddySessionAffinity;
+  /** Read at request time so a settings toggle applies to the next turn. */
+  enabled?: (() => boolean) | undefined;
+  /**
+   * Lanes that may borrow the other lane's accounts.
+   *
+   * The CN lane is the product's default entry point and is the one allowed to
+   * fall back to Global. The Global lane stays Global-only: someone who picked
+   * GPT-6-Astra there must not silently land on a CN-only model.
+   */
+  crossLaneFrom: WorkBuddyRegion;
 }
 declare function createWorkBuddyDualShim(options: WorkBuddyDualShimOptions): WorkBuddyDualShim;
 //#endregion
 //#region src/adapter.d.ts
 declare const WORKBUDDY_CN_PROVIDER = "workbuddy-cn";
 declare const WORKBUDDY_GLOBAL_PROVIDER = "workbuddy-global";
+/**
+ * Picker name of the CN route.
+ *
+ * It is no longer only CN: the route now spends CN accounts first and reaches
+ * for Global when every CN account is cooling down, so the old "WorkBuddy CN"
+ * label would describe only half of what a request may do.
+ */
+declare const WORKBUDDY_CN_DISPLAY_NAME = "WorkBuddy（国内优先）";
 interface WorkBuddyDualAdapterOptions {
   shim: WorkBuddyDualShim;
   catalog: WorkBuddyDualCatalog;
@@ -337,6 +482,25 @@ interface WorkBuddyDualAdapter {
   invalidate: () => void;
 }
 declare function createWorkBuddyDualAdapter(options: WorkBuddyDualAdapterOptions): WorkBuddyDualAdapter;
+//#endregion
+//#region src/credits-cache.d.ts
+declare class WorkBuddyCreditsCache {
+  private readonly entries;
+  private refreshing;
+  /** Balance if it was read recently, else whatever was read last. */
+  get(region: WorkBuddyRegion, uid: string): number | undefined;
+  set(region: WorkBuddyRegion, uid: string, total: number): void;
+  isFresh(region: WorkBuddyRegion, uid: string): boolean;
+  forget(region: WorkBuddyRegion, uid: string): void;
+  /**
+   * Refresh balances that are missing or stale.
+   *
+   * Never awaited by a request: a slow billing endpoint must not add a round
+   * trip to someone's chat turn. Failures leave the previous number in place.
+   */
+  refresh(store: WorkBuddyDualCredentialStore, client: WorkBuddyUpstreamClient): Promise<void>;
+  private run;
+}
 //#endregion
 //#region src/selection-store.d.ts
 interface WorkBuddyDualSelectionStoreOptions {
@@ -491,6 +655,30 @@ interface WorkBuddyWebRegionAccounts {
 interface WorkBuddyWebAccounts {
   cn: WorkBuddyWebRegionAccounts;
   global: WorkBuddyWebRegionAccounts;
+  /** Whether the router may switch accounts without being asked. */
+  autoRoute: boolean;
+  /** The order accounts would be tried in for the flash model, right now. */
+  routing: WorkBuddyWebRouting;
+}
+/** One account in the router's current order. */
+interface WorkBuddyWebRouteEntry {
+  region: WorkBuddyRegion;
+  uid: string;
+  displayName: string;
+  /** When this account becomes usable again, if it is cooling down. */
+  cooldownUntilMs?: number | undefined;
+  /** Short reason it is out of rotation. */
+  blocked?: string | undefined;
+}
+interface WorkBuddyWebRouting {
+  /** Model the order was computed for. */
+  model: string;
+  /** Usable accounts, in the order the next request would try them. */
+  order: readonly WorkBuddyWebRouteEntry[];
+  /** Accounts held back by a cooldown, soonest recovery first. */
+  blocked: readonly WorkBuddyWebRouteEntry[];
+  /** Epoch ms when the earliest blocked account frees up. */
+  nextRecoveryMs?: number | undefined;
 }
 //#endregion
 //#region src/account-route.d.ts
@@ -499,6 +687,26 @@ interface WorkBuddyDualAccountRouteOptions {
   client: WorkBuddyUpstreamClient;
   /** Rebuild catalogs and notify pickers after the active account changes. */
   onAccountChange?: ((region: WorkBuddyRegion) => void | Promise<void>) | undefined;
+  /** The automatic-switching preference and the route it produces. */
+  router?: {
+    settings: () => boolean;
+    setAutoRoute: (enabled: boolean) => Promise<boolean>;
+    /**
+     * Persist a probe verdict for routing.
+     *
+     * The panel's probe is a real one-token request, so its answer is exactly
+     * what the router needs. Without this the panel could show "limited until
+     * 07:28" while the router still handed the next turn to that same account
+     * and only learned about the limit by failing.
+     */
+    record: (region: WorkBuddyRegion, uid: string, model: string, probe: WorkBuddyWebProbe) => Promise<void>;
+    /** Accounts in the order the next flash request would try them. */
+    order: () => Promise<{
+      order: readonly WorkBuddyWebRouteEntry[];
+      blocked: readonly WorkBuddyWebRouteEntry[];
+      nextRecoveryMs?: number | undefined;
+    }>;
+  } | undefined;
 }
 interface CachedCredits {
   total: number;
@@ -513,6 +721,8 @@ declare function readAuthFile(path: string, region: WorkBuddyRegion): Promise<Wo
 interface WorkBuddyAccountRouteState {
   credits: Map<string, CachedCredits>;
   probes: Map<string, CachedProbe>;
+  /** Called with every fresh probe verdict, so the router sees it too. */
+  onProbe?: ((region: WorkBuddyRegion, uid: string, model: string, probe: WorkBuddyWebProbe) => void | Promise<void>) | undefined;
   /** One in-flight background refresh per lane, so polling cannot stack them. */
   refreshing: Map<WorkBuddyRegion, Promise<void>>;
   /** Lanes asked to refresh again as soon as the current pass finishes. */
@@ -528,10 +738,12 @@ declare const WORKBUDDY_DUAL_SETTINGS_NS = "workbuddy-dual";
 interface WorkBuddyDualConfig {
   cnAuthFile?: string;
   globalAuthFile?: string;
+  /** Automatic account switching; on by default, off restores manual only. */
+  autoRoute?: boolean;
 }
 declare const Config: z<WorkBuddyDualConfig>;
 declare const name = "dsh-workbuddy-dual";
 declare const inject: readonly ["llm"];
 declare function apply(ctx: Context, config?: WorkBuddyDualConfig): void;
 //#endregion
-export { AgentToolError, Config, WORKBUDDY_CN_PROVIDER, WORKBUDDY_DUAL_ACCOUNTS_PATH, WORKBUDDY_DUAL_SETTINGS_NS, WORKBUDDY_FLASH_MODEL, WORKBUDDY_GLOBAL_PROVIDER, WORKBUDDY_NATIVE_FETCH_SERVICE, WORKBUDDY_NATIVE_SEARCH_SERVICE, WorkBuddyAccountPool, WorkBuddyDualCatalog, WorkBuddyDualConfig, WorkBuddyDualCredentialStore, type WorkBuddyDualSelection, WorkBuddyDualSelectionStore, WorkBuddyUpstreamClient, advertisedModelIds, apply, createAccountRouteState, createAgentToolClient, createWorkBuddyDualAdapter, createWorkBuddyDualShim, createWorkBuddyNativeWeb, defaultSelection, filterModels, inject, name, normalizeLanePreference, normalizeSelection, poolDocumentPath, provideWorkBuddyNativeWeb, readAuthFile, toCredential, workBuddyAccountsView };
+export { AgentToolError, Config, REGION_ORDER, WORKBUDDY_CN_DISPLAY_NAME, WORKBUDDY_CN_PROVIDER, WORKBUDDY_DUAL_ACCOUNTS_PATH, WORKBUDDY_DUAL_SETTINGS_NS, WORKBUDDY_FLASH_MODEL, WORKBUDDY_GLOBAL_PROVIDER, WORKBUDDY_HEALTH_FILENAME, WORKBUDDY_NATIVE_FETCH_SERVICE, WORKBUDDY_NATIVE_SEARCH_SERVICE, WorkBuddyAccountPool, WorkBuddyCreditsCache, WorkBuddyDualCatalog, WorkBuddyDualConfig, WorkBuddyDualCredentialStore, type WorkBuddyDualSelection, WorkBuddyDualSelectionStore, WorkBuddyHealthStore, type WorkBuddyRouteCandidate, type WorkBuddyRouterOptions, WorkBuddySessionAffinity, WorkBuddyUpstreamClient, advertisedModelIds, apply, candidateKey, cooldownFor, createAccountRouteState, createAgentToolClient, createWorkBuddyDualAdapter, createWorkBuddyDualShim, createWorkBuddyNativeWeb, defaultSelection, filterModels, healthKey, inject, name, nextRecoveryMs, normalizeLanePreference, normalizeSelection, planRoute, poolDocumentPath, provideWorkBuddyNativeWeb, readAuthFile, toCredential, workBuddyAccountsView };

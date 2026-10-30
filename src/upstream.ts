@@ -63,14 +63,43 @@ function classifyUpstreamError(status: number, body: string): UpstreamErrorKind 
  * business code and, for 6004, the exact moment the model frees up. Reading
  * that timestamp beats estimating from credits: it is the upstream's own
  * schedule.
+ *
+ * The two lanes word it differently. CN sends
+ * `当前模型请求过于频繁，将在 2026-10-26 21:44:41 恢复`; Global sends
+ * `usage exceeds frequency limit, ... your usage will reset at
+ * 2026-10-31 07:28:11 UTC+8`. Matching only the CN phrasing left the Global
+ * panel with an empty reset slot, so both shapes parse here. The written zone
+ * is honoured when the message states one; otherwise +08:00 is assumed, which
+ * is what both gateways have sent so far.
  */
 export function parseResetTime(text: string): number | undefined {
-  const match = /将在\s*(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})/.exec(text)
+  const match = /(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}(?::\d{2})?)/.exec(text)
   if (match === null) return undefined
-  const [, day, clock] = match
-  // The gateway states the reset in the account's own zone; CN and Global
-  // share +08:00 in practice, and a wrong zone only shifts the displayed time.
-  const parsed = Date.parse(`${day}T${clock}+08:00`)
+  const day = match[1] ?? ''
+  const clock = match[2] ?? ''
+  // Only the trailing zone matters: `UTC+8` sits after the timestamp. ISO
+  // forms (`Z`, `+08:00`) and a bare `UTC` are accepted too, since a gateway
+  // may word it that way instead.
+  const tail = text.slice(match.index + match[0].length)
+  const zoned = /^\s*(?:UTC|GMT)\s*([+-]?\d{1,2})(?::(\d{2}))?/i.exec(tail)
+  const bareUtc = zoned === null && /^\s*(?:UTC|GMT)\s*(?:$|[),.;"}])/i.test(tail)
+  const iso = /^\s*(Z|[+-]\d{2}:?\d{2})\b/i.exec(tail)
+  let offset = '+08:00'
+  if (zoned !== null && zoned[1] !== undefined) {
+    const hoursPart = zoned[1]
+    const sign = hoursPart.startsWith('-') ? '-' : '+'
+    const hours = Math.abs(Number(hoursPart)).toString().padStart(2, '0')
+    offset = `${sign}${hours}:${zoned[2] ?? '00'}`
+  } else if (bareUtc) {
+    offset = '+00:00'
+  } else if (iso !== null && iso[1] !== undefined) {
+    const zone = iso[1].toUpperCase()
+    offset = zone === 'Z'
+      ? '+00:00'
+      : zone.includes(':') ? zone : `${zone.slice(0, 3)}:${zone.slice(3)}`
+  }
+  const time = clock.length === 5 ? `${clock}:00` : clock
+  const parsed = Date.parse(`${day}T${time}${offset}`)
   return Number.isFinite(parsed) ? parsed : undefined
 }
 

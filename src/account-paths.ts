@@ -68,6 +68,32 @@ export interface WorkBuddyWebRegionAccounts {
 export interface WorkBuddyWebAccounts {
   cn: WorkBuddyWebRegionAccounts
   global: WorkBuddyWebRegionAccounts
+  /** Whether the router may switch accounts without being asked. */
+  autoRoute: boolean
+  /** The order accounts would be tried in for the flash model, right now. */
+  routing: WorkBuddyWebRouting
+}
+
+/** One account in the router's current order. */
+export interface WorkBuddyWebRouteEntry {
+  region: WorkBuddyRegion
+  uid: string
+  displayName: string
+  /** When this account becomes usable again, if it is cooling down. */
+  cooldownUntilMs?: number | undefined
+  /** Short reason it is out of rotation. */
+  blocked?: string | undefined
+}
+
+export interface WorkBuddyWebRouting {
+  /** Model the order was computed for. */
+  model: string
+  /** Usable accounts, in the order the next request would try them. */
+  order: readonly WorkBuddyWebRouteEntry[]
+  /** Accounts held back by a cooldown, soonest recovery first. */
+  blocked: readonly WorkBuddyWebRouteEntry[]
+  /** Epoch ms when the earliest blocked account frees up. */
+  nextRecoveryMs?: number | undefined
 }
 
 /** POST bodies accepted by the account route. */
@@ -77,3 +103,4 @@ export type WorkBuddyAccountAction =
   | { action: 'remove'; region: WorkBuddyRegion; uid: string }
   | { action: 'relabel'; region: WorkBuddyRegion; uid: string; label: string }
   | { action: 'probe'; region: WorkBuddyRegion; uid?: string | undefined; model?: string | undefined }
+  | { action: 'autoroute'; enabled: boolean }

@@ -701,6 +701,35 @@ describe('flash probe parsing', () => {
     expect(reset).toBe(Date.parse('2026-10-26T21:44:41+08:00'))
   })
 
+  it('reads the Global lane reset time, which is stated in English', () => {
+    const message = '{"code":6004,"msg":"usage exceeds frequency limit, but don\'t worry, your usage will reset at 2026-10-31 07:28:11 UTC+8, alternatively, you can switch to the other models to continue using it."}'
+    expect(parseBusinessCode(message)).toBe('6004')
+    expect(parseResetTime(message)).toBe(Date.parse('2026-10-31T07:28:11+08:00'))
+  })
+
+  it('honours the zone the message states instead of assuming UTC+8', () => {
+    expect(parseResetTime('will reset at 2026-10-31 07:28:11 UTC+0'))
+      .toBe(Date.parse('2026-10-31T07:28:11Z'))
+    expect(parseResetTime('will reset at 2026-10-31 07:28:11 UTC-5'))
+      .toBe(Date.parse('2026-10-31T07:28:11-05:00'))
+    // Minutes in the offset are rare but legal; reading them wrong shifts the
+    // reset by up to 59 minutes.
+    expect(parseResetTime('will reset at 2026-10-31 07:28:11 UTC+05:30'))
+      .toBe(Date.parse('2026-10-31T07:28:11+05:30'))
+  })
+
+  it('accepts a reset time without seconds', () => {
+    expect(parseResetTime('your usage will reset at 2026-10-31 07:28 UTC+8'))
+      .toBe(Date.parse('2026-10-31T07:28:00+08:00'))
+  })
+
+  it('accepts ISO zone suffixes', () => {
+    expect(parseResetTime('reset at 2026-10-31T07:28:11Z'))
+      .toBe(Date.parse('2026-10-31T07:28:11Z'))
+    expect(parseResetTime('reset at 2026-10-31T07:28:11+08:00'))
+      .toBe(Date.parse('2026-10-31T07:28:11+08:00'))
+  })
+
   it('returns no reset time when the gateway does not state one', () => {
     expect(parseResetTime('{"code":11140,"msg":"账号已被封禁"}')).toBeUndefined()
     expect(parseBusinessCode('no code here')).toBeUndefined()

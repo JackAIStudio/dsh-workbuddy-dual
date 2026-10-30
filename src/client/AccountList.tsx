@@ -27,14 +27,19 @@ function readError(payload: unknown, fallback: string): string {
   return fallback
 }
 
-/** "21:44" today, or "明天 18:47" when the reset lands on another day. */
-function formatReset(resetsAtMs: number | undefined, t: Translate): string {
-  if (resetsAtMs === undefined) return t('probeRateLimited', { time: '—' })
+/**
+ * "10/31 07:28" — month, day, hour and minute, never a bare clock time.
+ *
+ * A reset can land after midnight, and CN and Global accounts run on different
+ * schedules, so a bare "07:28" leaves the user guessing which day it means.
+ * The upstream always states the exact second; the minute is enough to act on.
+ */
+function formatReset(resetsAtMs: number): string {
   const reset = new Date(resetsAtMs)
-  const now = new Date()
-  const sameDay = reset.toDateString() === now.toDateString()
+  const month = reset.getMonth() + 1
+  const day = reset.getDate()
   const clock = `${reset.getHours().toString().padStart(2, '0')}:${reset.getMinutes().toString().padStart(2, '0')}`
-  return sameDay ? clock : `${reset.getMonth() + 1}/${reset.getDate()} ${clock}`
+  return `${month}/${day} ${clock}`
 }
 
 function probeStyle(probe: WorkBuddyWebProbe | undefined): CSSProperties {
@@ -52,7 +57,12 @@ function probeLabel(probe: WorkBuddyWebProbe | undefined, t: Translate): string 
   if (probe === undefined) return t('probeNever')
   switch (probe.verdict) {
     case 'ok': return `✅ ${t('probeOk')}`
-    case 'rate-limited': return `⛔ ${t('probeRateLimited', { time: formatReset(probe.resetsAtMs, t) })}`
+    // The upstream does not always name a moment (a bare 429 does not). Saying
+    // "resets at ?" would be worse than saying the reset time is unknown, and
+    // leaving the placeholder out keeps the label from reading "limit · limit".
+    case 'rate-limited': return probe.resetsAtMs === undefined
+      ? `⛔ ${t('probeRateLimitedNoTime')}`
+      : `⛔ ${t('probeRateLimited', { time: formatReset(probe.resetsAtMs) })}`
     case 'banned': return `⛔ ${t('probeBanned')}`
     case 'no-credit': return `⛔ ${t('probeNoCredit')}`
     case 'auth': return `⛔ ${t('probeAuth')}`
@@ -397,14 +407,86 @@ export function WorkBuddyAccountList({ t }: { t: Translate }) {
       case 'probe':
         void send(action, action.uid === undefined ? `probe:${action.region}` : `probe:${action.uid}`)
         return
+      case 'autoroute':
+        void send(action, 'autoroute')
+        return
     }
   }
+
+  const autoRoute = view?.autoRoute !== false
+  const routing = view?.routing
 
   return (
     <section style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
       <div style={{ display: 'flex', alignItems: 'baseline', gap: 10 }}>
         <h3 style={{ margin: 0, fontSize: 14, fontWeight: 600 }}>{t('accountsTitle')}</h3>
         <span style={{ fontSize: 11.5, color: 'var(--text-secondary, #6b7280)' }}>{t('accountsIntro')}</span>
+      </div>
+
+      <div
+        style={{
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 6,
+          padding: '9px 11px',
+          borderRadius: 8,
+          border: `1px solid ${autoRoute ? 'rgba(34, 197, 94, 0.35)' : 'var(--border-color, #e5e7eb)'}`,
+          background: autoRoute ? 'rgba(34, 197, 94, 0.06)' : 'transparent',
+        }}
+      >
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, cursor: 'pointer' }}>
+          <input
+            type="checkbox"
+            checked={autoRoute}
+            disabled={busy !== undefined || view === null}
+            onChange={event => handle({ action: 'autoroute', enabled: event.target.checked })}
+          />
+          <span style={{ fontWeight: 600 }}>{t('autoRouteTitle')}</span>
+          <span style={{ fontSize: 11.5, color: 'var(--text-secondary, #6b7280)' }}>
+            {autoRoute ? t('autoRouteOn') : t('autoRouteOff')}
+          </span>
+        </label>
+        <div style={{ fontSize: 11, color: 'var(--text-secondary, #6b7280)' }}>{t('autoRouteHint')}</div>
+
+        {routing !== undefined && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 3, marginTop: 2 }}>
+            <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-secondary, #6b7280)' }}>
+              {t('routingTitle', { model: routing.model })}
+            </div>
+            {routing.order.length === 0 && routing.blocked.length === 0 && (
+              <div style={{ fontSize: 11.5, color: '#ef4444' }}>
+                {t('routingEmpty', { model: routing.model })}
+              </div>
+            )}
+            {routing.order.slice(0, 3).map((entry, index) => (
+              <div key={`${entry.region}/${entry.uid}`} style={{ fontSize: 11.5, display: 'flex', gap: 6 }}>
+                <span style={{ color: 'var(--text-secondary, #6b7280)' }}>{index + 1}.</span>
+                <span>{entry.region === 'cn' ? '🇨🇳' : '🌍'} {entry.displayName}</span>
+                {index === 0 && (
+                  <span style={{ color: '#22c55e' }}>{t('routingNext')}</span>
+                )}
+              </div>
+            ))}
+            {routing.blocked.slice(0, 3).map(entry => (
+              <div
+                key={`blocked-${entry.region}/${entry.uid}`}
+                style={{ fontSize: 11.5, display: 'flex', gap: 6, color: 'var(--text-secondary, #6b7280)' }}
+              >
+                <span>{entry.region === 'cn' ? '🇨🇳' : '🌍'} {entry.displayName}</span>
+                <span>
+                  {entry.cooldownUntilMs === undefined
+                    ? entry.blocked ?? ''
+                    : t('routingBlocked', { time: formatReset(entry.cooldownUntilMs) })}
+                </span>
+              </div>
+            ))}
+            {routing.nextRecoveryMs !== undefined && (
+              <div style={{ fontSize: 11, color: '#f59e0b' }}>
+                {t('routingRecovery', { time: formatReset(routing.nextRecoveryMs) })}
+              </div>
+            )}
+          </div>
+        )}
       </div>
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: 12 }}>
         <RegionAccounts

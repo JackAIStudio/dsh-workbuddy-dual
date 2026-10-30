@@ -8,8 +8,11 @@ import { GATEWAY_BODY_LIMIT_BYTES, MAX_REQUEST_BODY_BYTES } from './budget.ts'
 import type { WorkBuddyDualCredentialStore } from './auth.ts'
 import type { WorkBuddyDualCatalog } from './catalog.ts'
 import { hostIsLoopback, originIsLoopback } from './loopback.ts'
+import type { WorkBuddyRouteCandidate, WorkBuddyRouterOptions, WorkBuddySessionAffinity } from './router.ts'
+import { candidateKey, nextRecoveryMs, planRoute } from './router.ts'
+import { parseBusinessCode, parseResetTime, WorkBuddyUpstreamClient } from './upstream.ts'
 import type { WorkBuddyRegion } from './types.ts'
-import { WorkBuddyUpstreamClient } from './upstream.ts'
+import type { WorkBuddyProbeVerdict } from './types.ts'
 
 export interface WorkBuddyDualShim {
   readonly origin: string
@@ -23,7 +26,44 @@ export interface WorkBuddyDualShimOptions {
   client: WorkBuddyUpstreamClient
   catalog: WorkBuddyDualCatalog
   logger?: { info: (msg: string, ...args: unknown[]) => void; error: (msg: string, ...args: unknown[]) => void }
+  /**
+   * Automatic account routing. Omit it to keep the single selected account per
+   * lane, which is what the unit tests that predate routing rely on.
+   */
+  route?: WorkBuddyRouteOptions | undefined
 }
+
+export interface WorkBuddyRouteOptions {
+  router: WorkBuddyRouterOptions
+  affinity: WorkBuddySessionAffinity
+  /** Read at request time so a settings toggle applies to the next turn. */
+  enabled?: (() => boolean) | undefined
+  /**
+   * Lanes that may borrow the other lane's accounts.
+   *
+   * The CN lane is the product's default entry point and is the one allowed to
+   * fall back to Global. The Global lane stays Global-only: someone who picked
+   * GPT-6-Astra there must not silently land on a CN-only model.
+   */
+  crossLaneFrom: WorkBuddyRegion
+}
+
+/** Gateway codes that mean "this account cannot run this model right now". */
+const ACCOUNT_BLOCK_CODES = ['6004', '11140', '14018'] as const
+
+/** Cap on the first-frame peek; a normal SSE event is far smaller. */
+const HEAD_PEEK_LIMIT = 64 * 1024
+
+/**
+ * How long a turn may wait for a cooldown to lift before giving up.
+ *
+ * The harness retries a 429 a few times and then ends the turn, so failing
+ * immediately on a limit that lifts in twenty seconds wastes the retries on
+ * requests that could not possibly succeed. Waiting here keeps the turn alive
+ * and keeps the user's prompt intact. Anything longer than this is reported
+ * with its recovery time so the user can decide.
+ */
+const SHORT_COOLDOWN_WAIT_MS = 60_000
 
 /** Bodies above this size are logged, because they are one image away from the gateway cap. */
 const REQUEST_BODY_WARN_BYTES = 12 * 1024 * 1024
@@ -333,6 +373,51 @@ export function prepareChatBody(source: string, region: WorkBuddyRegion = 'cn'):
   return JSON.stringify(obj)
 }
 
+/**
+ * Read the first upstream frame without committing a response to the client.
+ *
+ * The gateway answers a rate-limited stream with HTTP 200 and an SSE frame
+ * carrying `6004`, so the status code alone cannot tell a working account from
+ * a blocked one. Anything already written to the client is final, which is why
+ * the header has to wait until this peek says the stream is real. A frame that
+ * arrives whole is returned with the reader so the same bytes are forwarded
+ * rather than dropped; a frame larger than the cap is forwarded unexamined.
+ */
+export interface WorkBuddyHeadPeek {
+  /** Every byte read so far, in order; forwarding these loses nothing. */
+  buffered: readonly Uint8Array[]
+  reader: ReadableStreamDefaultReader<Uint8Array>
+  /** Business code seen in the first frame, when the gateway sent one. */
+  code: string | undefined
+  /** True when the first frame carries a block verdict for this account. */
+  blocked: boolean
+  /** Text of the first frame, truncated; used for reset-time parsing. */
+  head: string
+}
+
+export async function peekFirstFrame(response: Response): Promise<WorkBuddyHeadPeek | undefined> {
+  const reader = response.body?.getReader()
+  if (reader === undefined) return undefined
+  const buffered: Uint8Array[] = []
+  let text = ''
+  while (text.length < HEAD_PEEK_LIMIT) {
+    const { done, value } = await reader.read()
+    if (done) break
+    if (value !== undefined && value.byteLength > 0) {
+      // A single SSE event can arrive split across chunks. Keeping every chunk
+      // (not just the first) is what makes forwarding the peek lossless.
+      buffered.push(value)
+      text += new TextDecoder().decode(value, { stream: true })
+      // The business code is announced in the first complete SSE event; once
+      // one has arrived there is nothing left to learn from waiting.
+      if (/\n\n/u.test(text) || text.includes('[DONE]')) break
+    }
+  }
+  const code = parseBusinessCode(text)
+  const blocked = code !== undefined && (ACCOUNT_BLOCK_CODES as readonly string[]).includes(code)
+  return { buffered, reader, code, blocked, head: text }
+}
+
 function stripHarnessSignatureFromContent(content: unknown, region: WorkBuddyRegion): unknown {
   const rewrite = (source: string): string => {
     const stripped = stripForeignHarnessSignature(source)
@@ -355,8 +440,64 @@ function stripHarnessSignatureFromContent(content: unknown, region: WorkBuddyReg
 }
 
 export function createWorkBuddyDualShim(options: WorkBuddyDualShimOptions): WorkBuddyDualShim {
-  const { store, client, catalog, logger } = options
+  const { store, client, catalog, logger, route } = options
   let origin = 'http://127.0.0.1:0'
+
+  /**
+   * The session this request belongs to.
+   *
+   * pi-ai sends the harness session id as `x-client-request-id` (and
+   * `x-session-affinity`) only when its compat flag says so. The adapter turns
+   * that flag on for both providers, which is what lets one conversation stay
+   * on one account even though every step is a separate HTTP request.
+   */
+  const sessionKeyOf = (req: IncomingMessage): string | undefined => {
+    const header = req.headers['x-session-affinity'] ?? req.headers['x-client-request-id'] ?? req.headers['session_id']
+    const value = Array.isArray(header) ? header[0] : header
+    return typeof value === 'string' && value !== '' ? value : undefined
+  }
+
+  const modelOf = (raw: string): string | undefined => {
+    try {
+      const body = JSON.parse(raw) as Record<string, unknown>
+      return typeof body['model'] === 'string' ? body['model'] : undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  /** Model id as the prepared body carries it, for the health key. */
+  const preparedModel = (prepared: string): string => modelOf(prepared) ?? 'deepseek-v4.1-flash'
+
+  /**
+   * Ordered accounts for this request, or one entry for the legacy behaviour.
+   *
+   * Without a router the lane keeps using the sign-in the user selected, which
+   * is what every pre-router caller (and the live verifier script) expects.
+   */
+  const candidatesFor = async (
+    req: IncomingMessage,
+    region: WorkBuddyRegion,
+    raw: string,
+  ): Promise<{ candidates: WorkBuddyRouteCandidate[]; sessionKey: string | undefined; model: string | undefined }> => {
+    const model = modelOf(raw)
+    const sessionKey = sessionKeyOf(req)
+    if (route === undefined || model === undefined || route.enabled?.() === false) {
+      const credential = await store.storeFor(region).resolve()
+      return {
+        candidates: [{ region, uid: credential.uid, credential, source: 'fallback', label: credential.nickname ?? credential.uid }],
+        sessionKey,
+        model,
+      }
+    }
+    const crossLane = region === route.crossLaneFrom
+    const candidates = await planRoute(
+      route.router,
+      route.affinity,
+      { model, sessionKey, ...(crossLane ? {} : { region }) },
+    )
+    return { candidates, sessionKey, model }
+  }
 
   const server: Server = createServer(async (req, res) => {
     try {
@@ -421,14 +562,6 @@ export function createWorkBuddyDualShim(options: WorkBuddyDualShimOptions): Work
       return
     }
 
-    let credential
-    try {
-      credential = await store.storeFor(region).resolve()
-    } catch (err: unknown) {
-      writeOpenAIError(res, 401, 'not_signed_in', String(err))
-      return
-    }
-
     let body: Buffer
     try {
       body = await readBody(req)
@@ -449,44 +582,111 @@ export function createWorkBuddyDualShim(options: WorkBuddyDualShimOptions): Work
 
     logBodySize(logger, region, body.length)
     const raw = body.toString('utf8')
-    const prepared = prepareChatBody(raw, region)
 
     const controller = new AbortController()
     req.on('close', () => controller.abort())
 
-    const result = await client.chatStream(credential, prepared, controller.signal)
-    if (!result.ok) {
-      logUpstreamRejection(logger, region, body.length, result.status, result.message)
-      const status = result.status >= 400 && result.status < 600 ? result.status : 502
-      writeOpenAIError(res, status, result.kind, result.message)
-      return
-    }
-
-    // Stream SSE to client
-    res.writeHead(200, {
-      'Content-Type': 'text/event-stream; charset=utf-8',
-      'Cache-Control': 'no-cache, no-transform',
-      'Connection': 'keep-alive',
-      'X-Accel-Buffering': 'no',
-    })
-
-    if (!result.response.body) {
-      res.end('data: [DONE]\n\n')
-      return
-    }
-
-    const reader = result.response.body.getReader()
-    try {
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-        if (value) res.write(value)
+    let candidates: WorkBuddyRouteCandidate[] = []
+    let sessionKey: string | undefined
+    let model: string | undefined
+    let recovery: number | undefined
+    // A cooldown that lifts shortly is worth waiting out: failing now would
+    // end the turn even though a usable account is about to exist.
+    for (let attempt = 0; ; attempt++) {
+      try {
+        ({ candidates, sessionKey, model } = await candidatesFor(req, region, raw))
+      } catch (err: unknown) {
+        writeOpenAIError(res, 401, 'not_signed_in', String(err))
+        return
       }
-    } catch (err) {
-      logger?.error(`Streaming failed for ${region}:`, err)
-    } finally {
-      res.end()
+      if (candidates.length > 0) break
+      recovery = model === undefined || route === undefined
+        ? undefined
+        : await nextRecoveryMs(route.router, model, region === route.crossLaneFrom ? undefined : region)
+      const wait = recovery === undefined ? Infinity : recovery - Date.now()
+      if (attempt > 0 || !Number.isFinite(wait) || wait > SHORT_COOLDOWN_WAIT_MS) break
+      await new Promise(resolve => setTimeout(resolve, Math.max(250, wait + 250)))
+      if (controller.signal.aborted) return
     }
+    if (candidates.length === 0) {
+      // Every account for this model is cooling down for longer than a turn can
+      // wait. Name the moment one frees up instead of a bare 429 the harness
+      // would retry blindly.
+      const when = recovery === undefined ? '' : ` Retry after ${new Date(recovery).toISOString()}.`
+      writeOpenAIError(res, 429, 'rate', `No WorkBuddy account can run ${model ?? 'this model'} right now.${when}`)
+      return
+    }
+
+    let lastError: { status: number; kind: string; message: string } | undefined
+    for (const candidate of candidates) {
+      if (controller.signal.aborted) return
+      const prepared = prepareChatBody(raw, candidate.region)
+      const result = await client.chatStream(candidate.credential, prepared, controller.signal)
+      if (!result.ok) {
+        logUpstreamRejection(logger, candidate.region, body.length, result.status, result.message)
+        lastError = { status: result.status, kind: result.kind, message: result.message }
+        // Only an account-level refusal is worth another account. A 400 or a
+        // bad request would fail identically everywhere and re-sending it would
+        // just burn the remaining accounts' rate budget.
+        const retriable = result.kind === 'rate' || result.kind === 'auth' || result.kind === 'credit'
+        if (route !== undefined) {
+          await route.router.health.record(candidate.region, candidate.uid, model ?? preparedModel(prepared), verdictForFailure(result.kind, result.message), {
+            resetsAtMs: parseResetTime(result.message),
+            detail: result.message.slice(0, 200),
+          })
+        }
+        if (!retriable) break
+        continue
+      }
+
+      // Hold the client response until the first frame proves this account is
+      // not answering with a rate-limit event behind an HTTP 200.
+      const peek = await peekFirstFrame(result.response)
+      if (peek?.blocked === true) {
+        const verdict = peek.code === '11140' ? 'banned' : peek.code === '14018' ? 'no-credit' : 'rate-limited'
+        await peek.reader.cancel().catch(() => {})
+        if (route !== undefined) {
+          await route.router.health.record(candidate.region, candidate.uid, model ?? preparedModel(prepared), verdict, {
+            resetsAtMs: parseResetTime(peek.head),
+            detail: peek.head.slice(0, 200),
+          })
+        }
+        lastError = { status: 429, kind: verdict === 'rate-limited' ? 'rate' : verdict, message: peek.head.slice(0, 2000) }
+        continue
+      }
+
+      if (route !== undefined) {
+        await route.router.health.record(candidate.region, candidate.uid, model ?? preparedModel(prepared), 'ok')
+        route.affinity.remember(sessionKey, candidate.region, candidate.uid)
+      }
+
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-cache, no-transform',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no',
+        ...(route === undefined ? {} : { 'X-WorkBuddy-Account': `${candidate.region}/${candidate.label}` }),
+      })
+      try {
+        if (peek !== undefined) {
+          for (const chunk of peek.buffered) res.write(chunk)
+          while (true) {
+            const { done, value } = await peek.reader.read()
+            if (done) break
+            if (value !== undefined) res.write(value)
+          }
+        }
+      } catch (err) {
+        logger?.error(`Streaming failed for ${candidate.region}:`, err)
+      } finally {
+        res.end()
+      }
+      return
+    }
+
+    const status = lastError === undefined ? 502 : lastError.status >= 400 && lastError.status < 600 ? lastError.status : 502
+    writeOpenAIError(res, status, lastError?.kind ?? 'server', lastError?.message ?? 'every WorkBuddy account failed')
+    return
   }
 
   const ready = new Promise<void>((resolve, reject) => {
@@ -510,4 +710,23 @@ export function createWorkBuddyDualShim(options: WorkBuddyDualShimOptions): Work
       })
     },
   }
+}
+
+/**
+ * Which verdict an upstream refusal represents.
+ *
+ * The HTTP status alone is not enough: Global answers a banned account with
+ * `403 / 11140 request illegal`, which would otherwise be filed as an expired
+ * sign-in and retried every thirty minutes forever. The business code is the
+ * gateway's own reason, so it wins when present.
+ */
+export function verdictForFailure(kind: string, message: string): WorkBuddyProbeVerdict {
+  const code = parseBusinessCode(message)
+  if (code === '6004') return 'rate-limited'
+  if (code === '11140') return 'banned'
+  if (code === '14018') return 'no-credit'
+  if (kind === 'rate') return 'rate-limited'
+  if (kind === 'credit') return 'no-credit'
+  if (kind === 'auth') return 'auth'
+  return 'error'
 }

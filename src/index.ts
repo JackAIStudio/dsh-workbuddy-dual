@@ -27,6 +27,12 @@ import { registerWorkBuddyDualAccountRoutes } from './account-route.ts'
 import { clearHostHeartbeat, writeHostHeartbeat } from './host-heartbeat.ts'
 import { createAgentToolClient } from './agenttool.ts'
 import { createWorkBuddyNativeWeb, provideWorkBuddyNativeWeb } from './native-web.ts'
+import { WORKBUDDY_FLASH_MODEL } from './account-paths.ts'
+import { WorkBuddyHealthStore } from './health.ts'
+import { WorkBuddyCreditsCache } from './credits-cache.ts'
+import { WorkBuddySessionAffinity, routeOverview } from './router.ts'
+import { WorkBuddyRouterSettingsStore } from './router-settings.ts'
+import type { WorkBuddyRouteOptions } from './shim.ts'
 import type { WorkBuddyModelInfo, WorkBuddyRegion } from './types.ts'
 
 export {
@@ -38,6 +44,18 @@ export { WorkBuddyDualCredentialStore } from './auth.ts'
 export { WorkBuddyDualCatalog } from './catalog.ts'
 export { WorkBuddyUpstreamClient } from './upstream.ts'
 export { createWorkBuddyDualShim } from './shim.ts'
+export { WORKBUDDY_CN_DISPLAY_NAME } from './adapter.ts'
+export { WorkBuddyHealthStore, cooldownFor, healthKey, WORKBUDDY_HEALTH_FILENAME } from './health.ts'
+export {
+  WorkBuddySessionAffinity,
+  candidateKey,
+  nextRecoveryMs,
+  planRoute,
+  REGION_ORDER,
+  type WorkBuddyRouteCandidate,
+  type WorkBuddyRouterOptions,
+} from './router.ts'
+export { WorkBuddyCreditsCache } from './credits-cache.ts'
 export { WorkBuddyDualSelectionStore } from './selection-store.ts'
 export { WorkBuddyAccountPool, poolDocumentPath, toCredential } from './accounts.ts'
 export {
@@ -63,11 +81,14 @@ export const WORKBUDDY_DUAL_SETTINGS_NS = 'workbuddy-dual'
 export interface WorkBuddyDualConfig {
   cnAuthFile?: string
   globalAuthFile?: string
+  /** Automatic account switching; on by default, off restores manual only. */
+  autoRoute?: boolean
 }
 
 export const Config: z<WorkBuddyDualConfig> = z.object({
   cnAuthFile: z.string().description('WorkBuddy CN auth file (defaults to workbuddy-desktop.info)'),
   globalAuthFile: z.string().description('WorkBuddy Global auth file (defaults to workbuddy-desktop-ai.info)'),
+  autoRoute: z.boolean().default(true).description('Switch to another account automatically when one is rate limited'),
 }) as unknown as z<WorkBuddyDualConfig>
 
 export const name = 'dsh-workbuddy-dual'
@@ -84,7 +105,25 @@ export function apply(ctx: Context, config: WorkBuddyDualConfig = {}): void {
 
   const catalog = new WorkBuddyDualCatalog()
   const selection = new WorkBuddyDualSelectionStore()
-  const shim = createWorkBuddyDualShim({ store, client, catalog, logger: ctx.logger })
+  const health = new WorkBuddyHealthStore()
+  const credits = new WorkBuddyCreditsCache()
+  const affinity = new WorkBuddySessionAffinity()
+  const routerSettings = new WorkBuddyRouterSettingsStore()
+  const routeOptions: WorkBuddyRouteOptions = {
+    router: {
+      store,
+      client,
+      health,
+      credits: (region, uid) => credits.get(region, uid),
+      hasModel: (region, model) => catalog.modelsFor(region).some(info => info.id === model),
+    },
+    affinity,
+    // Only the default entry point borrows the other lane. Picking WorkBuddy
+    // Global to reach GPT-6-Astra must not land on a CN account.
+    crossLaneFrom: 'cn',
+    enabled: () => routerSettings.current().autoRoute && currentConfig().autoRoute !== false,
+  }
+  const shim = createWorkBuddyDualShim({ store, client, catalog, logger: ctx.logger, route: routeOptions })
 
   /**
    * Region of the model this turn runs, read the same way web-search-follow
@@ -157,6 +196,26 @@ export function apply(ctx: Context, config: WorkBuddyDualConfig = {}): void {
     registerWorkBuddyDualAccountRoutes(webCtx, {
       store,
       client,
+      router: {
+        settings: () => routerSettings.current().autoRoute,
+        setAutoRoute: async (enabled: boolean) => (await routerSettings.set({ autoRoute: enabled })).autoRoute,
+        record: async (region, uid, model, probe) => {
+          await health.record(region, uid, model, probe.verdict, {
+            ...(probe.resetsAtMs === undefined ? {} : { resetsAtMs: probe.resetsAtMs }),
+            ...(probe.detail === undefined ? {} : { detail: probe.detail }),
+          })
+        },
+        order: () => routeOverview(
+          {
+            store,
+            client,
+            health,
+            credits: (region, uid) => credits.get(region, uid),
+            hasModel: (region, model) => catalog.modelsFor(region).some(info => info.id === model),
+          },
+          WORKBUDDY_FLASH_MODEL,
+        ),
+      },
       onAccountChange(region) {
         // A different account can carry a different model catalog (an
         // enterprise sign-in may expose models a personal one does not), so
@@ -213,6 +272,19 @@ export function apply(ctx: Context, config: WorkBuddyDualConfig = {}): void {
     if (stopped) return
 
     try {
+      // Read the persisted preference before the first request so a user who
+      // turned automatic switching off does not get one surprise switch after a
+      // restart.
+      void routerSettings.get()
+      // Balances are what ordering reads; fill them once, then keep them warm
+      // well inside their TTL so a chat turn never waits on a billing call.
+      void credits.refresh(store, client)
+      const creditsTimer = setInterval(() => {
+        void credits.refresh(store, client)
+      }, 60_000)
+      creditsTimer.unref?.()
+      ctx.effect(() => () => clearInterval(creditsTimer))
+
       const workbuddy = createWorkBuddyDualAdapter({
         shim,
         catalog,
