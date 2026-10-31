@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import { WorkBuddyDualCredentialStore } from '../src/auth.ts'
 import { WorkBuddyHealthStore, cooldownFor, healthKey } from '../src/health.ts'
 import { WorkBuddySessionAffinity, candidateKey, planRoute, routeOverview } from '../src/router.ts'
-import { createWorkBuddyDualShim, verdictForFailure } from '../src/shim.ts'
+import { createWorkBuddyDualShim, headerSafe, verdictForFailure } from '../src/shim.ts'
 import { WorkBuddyDualCatalog } from '../src/catalog.ts'
 import type { WorkBuddyCredential } from '../src/types.ts'
 
@@ -335,7 +335,7 @@ describe('shim switches accounts before answering', () => {
         body: JSON.stringify({ model: FLASH, messages: [{ role: 'user', content: 'hi' }] }),
       })
       expect(response.status).toBe(200)
-      expect(response.headers.get('x-workbuddy-account')).toBe('global/gl-ok')
+      expect(response.headers.get('x-workbuddy-account')).toBe('global/gl-ok/gl-ok')
       // The client sees the healthy stream, not the 6004 frame that would have
       // stalled the harness after its 200 header went out.
       expect(await response.text()).toContain('hello')
@@ -427,6 +427,56 @@ describe('shim switches accounts before answering', () => {
     } finally {
       await shim.close()
     }
+  })
+
+  it('answers normally when the account label is Chinese', async () => {
+    // Reproduces the live 500: the diagnostic header carried "JackAI独立开发",
+    // Node rejected it as ERR_INVALID_CHAR after the upstream call had already
+    // succeeded, so a healthy turn died on its own debug output.
+    const store = await buildStore()
+    const account = credential('cn', 'cn-chinese')
+    await store.poolFor('cn').upsert(account)
+    await store.poolFor('cn').relabel('cn-chinese', 'JackAI独立开发')
+
+    const health = new WorkBuddyHealthStore({ path: join(dir, 'health.json') })
+    const client = {
+      async refreshToken() { return { accessToken: 'x' } },
+      async chatStream() { return { ok: true as const, response: sseOk('正常') } },
+    }
+    const shim = createWorkBuddyDualShim({
+      store,
+      client: client as never,
+      catalog: new WorkBuddyDualCatalog(),
+      route: {
+        router: { store, client: client as never, health, credits: () => 100 },
+        affinity: new WorkBuddySessionAffinity(),
+        crossLaneFrom: 'cn',
+      },
+    })
+
+    await shim.ready
+    try {
+      const response = await fetch(`${shim.origin}/cn/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: FLASH, messages: [{ role: 'user', content: 'hi' }] }),
+      })
+      expect(response.status).toBe(200)
+      expect(await response.text()).toContain('正常')
+      // The header survives in ASCII form and still identifies the account.
+      expect(response.headers.get('x-workbuddy-account')).toBe('cn/cn-chinese/JackAI')
+    } finally {
+      await shim.close()
+    }
+  })
+})
+
+describe('header safety', () => {
+  it('drops every byte a header cannot carry', () => {
+    expect(headerSafe('JackAI独立开发')).toBe('JackAI')
+    expect(headerSafe('173****0329')).toBe('173****0329')
+    expect(headerSafe('cn/uid/emoji😀')).toBe('cn/uid/emoji')
+    expect(headerSafe('a\r\nb')).toBe('ab')
   })
 })
 

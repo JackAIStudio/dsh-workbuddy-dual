@@ -55,6 +55,21 @@ const ACCOUNT_BLOCK_CODES = ['6004', '11140', '14018'] as const
 const HEAD_PEEK_LIMIT = 64 * 1024
 
 /**
+ * Make a value safe to put in an HTTP header.
+ *
+ * Account labels are user-editable and often Chinese ("JackAI独立开发"), and a
+ * header value is bytes, not text: Node throws `ERR_INVALID_CHAR` on anything
+ * above U+00FF, which surfaces as a 500 after the upstream call already
+ * succeeded. Diagnostics must never be able to break a working response, so
+ * non-ASCII characters are dropped here and the account id is used alongside
+ * the label where identity matters.
+ */
+export function headerSafe(value: string): string {
+  // eslint-disable-next-line no-control-regex
+  return value.replace(/[^\x20-\x7E]/gu, '').trim()
+}
+
+/**
  * How long a turn may wait for a cooldown to lift before giving up.
  *
  * The harness retries a 429 a few times and then ends the turn, so failing
@@ -665,7 +680,11 @@ export function createWorkBuddyDualShim(options: WorkBuddyDualShimOptions): Work
         'Cache-Control': 'no-cache, no-transform',
         'Connection': 'keep-alive',
         'X-Accel-Buffering': 'no',
-        ...(route === undefined ? {} : { 'X-WorkBuddy-Account': `${candidate.region}/${candidate.label}` }),
+        // ASCII only, and the uid keeps the header useful even when the label
+        // is entirely Chinese and gets stripped.
+        ...(route === undefined
+          ? {}
+          : { 'X-WorkBuddy-Account': headerSafe(`${candidate.region}/${candidate.uid}/${candidate.label}`) }),
       })
       try {
         if (peek !== undefined) {
