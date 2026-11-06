@@ -259,6 +259,10 @@ describe('dsh-workbuddy-dual', () => {
     const globalModels = catalog.modelsFor('global')
 
     expect(cnModels.some(m => m.id === 'deepseek-v4.1-flash')).toBe(true)
+    // The placeholder catalog must carry the id Global really serves, or the
+    // cross-lane alias never fires before the live catalog arrives.
+    expect(globalModels.some(m => m.id === 'deepseek-v4.1-flash-sg')).toBe(true)
+    expect(globalModels.some(m => m.id === 'deepseek-v4.1-flash')).toBe(false)
     expect(globalModels.some(m => m.id === 'gpt-6-astra')).toBe(true)
   })
 

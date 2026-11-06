@@ -43,7 +43,7 @@ async function main() {
   catalog.setModels('global', globalModels)
 
   console.log('   🇨🇳 CN Models Count:    ', cnModels.length, `(deepseek-v4.1-flash: ${cnModels.find(m => m.id === 'deepseek-v4.1-flash')?.billing?.credits})`)
-  console.log('   🌍 Global Models Count:', globalModels.length, `(deepseek-v4.1-flash: ${globalModels.find(m => m.id === 'deepseek-v4.1-flash')?.billing?.credits})`)
+  console.log('   🌍 Global Models Count:', globalModels.length, `(deepseek-v4.1-flash-sg: ${globalModels.find(m => m.id === 'deepseek-v4.1-flash-sg')?.billing?.credits})`)
 
   // 4. Test Shim Loopback Server
   console.log('\n4. Starting Loopback Shim Server...')

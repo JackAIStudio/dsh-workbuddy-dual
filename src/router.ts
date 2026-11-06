@@ -45,6 +45,13 @@ export interface WorkBuddyRouteCandidate {
   source: 'pool' | 'fallback'
   label: string
   credits?: number | undefined
+  /**
+   * Model id to send to this lane, which may differ from the requested one.
+   *
+   * Flash is `deepseek-v4.1-flash` on CN and `deepseek-v4.1-flash-sg` on
+   * Global. The shim rewrites the body's `model` per candidate with this.
+   */
+  wireModel?: string | undefined
 }
 
 export interface WorkBuddyRouteRequest {
@@ -75,11 +82,25 @@ export interface WorkBuddyRouterOptions {
   /**
    * Whether this lane's catalog offers the model at all.
    *
-   * Crossing lanes is only useful for models both gateways serve — Flash is on
-   * both. A CN-only model (Kimi) has no Global equivalent, and sending it there
-   * would trade a rate limit for an unknown model error.
+   * Crossing lanes is only useful for models both gateways serve. A CN-only
+   * model (Kimi) has no Global equivalent, and sending it there would trade a
+   * rate limit for an unknown model error.
    */
   hasModel?: ((region: WorkBuddyRegion, model: string) => boolean) | undefined
+  /**
+   * The model id to send to this lane, or undefined when it cannot run the
+   * product.
+   *
+   * Defaults to `hasModel`, which means "same id on both lanes". The catalog
+   * supplies a wider answer for products published under two ids (Flash is
+   * `deepseek-v4.1-flash` on CN and `deepseek-v4.1-flash-sg` on Global).
+   *
+   * This is deliberately separate from `hasModel`: asking an alias-aware
+   * predicate "does Global have deepseek-v4.1-flash?" answers yes because the
+   * alias exists, and using that answer to pick the wire id sends the CN id to
+   * Global — which the gateway rejects.
+   */
+  resolveModel?: ((region: WorkBuddyRegion, model: string) => string | undefined) | undefined
   now?: (() => number) | undefined
 }
 
@@ -87,6 +108,25 @@ export type CandidateKey = string
 
 export function candidateKey(region: WorkBuddyRegion, uid: string): CandidateKey {
   return `${region}/${uid}`
+}
+
+/**
+ * The id `region` must receive for `model`, or undefined when it cannot serve
+ * that product at all.
+ *
+ * Without a catalog the router cannot prove anything about the far lane, so it
+ * keeps the caller's id verbatim and lets the gateway answer. That is what the
+ * unit tests and the live verifier expect.
+ */
+function wireModelFor(
+  options: WorkBuddyRouterOptions,
+  region: WorkBuddyRegion,
+  model: string,
+): string | undefined {
+  if (options.resolveModel !== undefined) return options.resolveModel(region, model)
+  const has = options.hasModel
+  if (has === undefined) return model
+  return has(region, model) ? model : undefined
 }
 
 /**
@@ -227,14 +267,20 @@ export async function planRoute(
   const regions = request.region === undefined ? REGION_ORDER : [request.region]
   const pool: WorkBuddyRouteCandidate[] = []
   for (const region of regions) {
-    if (options.hasModel !== undefined && !options.hasModel(region, request.model)) continue
-    pool.push(...await laneCandidates(options, region, request.refreshTokens !== false))
+    const wireModel = wireModelFor(options, region, request.model)
+    if (wireModel === undefined) continue
+    const candidates = await laneCandidates(options, region, request.refreshTokens !== false)
+    pool.push(...candidates.map(candidate => ({ ...candidate, wireModel })))
   }
 
   const available: WorkBuddyRouteCandidate[] = []
   for (const candidate of pool) {
     if (request.exclude?.has(candidateKey(candidate.region, candidate.uid)) === true) continue
-    if (await options.health.isBlocked(candidate.region, candidate.uid, request.model)) continue
+    // A verdict is filed under the id the lane runs, which is not always the
+    // id the caller asked for. Looking up the caller's id would miss a Global
+    // rate limit stored as `deepseek-v4.1-flash-sg` and keep handing turns to
+    // an account that is still cooling down.
+    if (await options.health.isBlocked(candidate.region, candidate.uid, candidate.wireModel ?? request.model)) continue
     available.push(candidate)
   }
 
@@ -267,9 +313,15 @@ export async function nextRecoveryMs(
   let earliest: number | undefined
   const snapshot = await options.health.snapshot()
   for (const key of Object.keys(snapshot)) {
-    if (!key.endsWith(`/${model}`)) continue
-    const matchesRegion = regions.some(candidate => key.startsWith(`${candidate}/`))
-    if (!matchesRegion) continue
+    // A health key is `region/uid/model`; the id at the end is the lane's own,
+    // so the far lane stores `deepseek-v4.1-flash-sg` for the same product.
+    // Match through the alias or the recovery time of a crossed lane is missed
+    // and the turn gives up instead of waiting for the account that is about
+    // to free up.
+    const matched = regions.find(candidate => key.startsWith(`${candidate}/`))
+    if (matched === undefined) continue
+    const wireModel = wireModelFor(options, matched, model)
+    if (wireModel === undefined || !key.endsWith(`/${wireModel}`)) continue
     const until = snapshot[key]?.cooldownUntilMs
     if (until === undefined) continue
     if (earliest === undefined || until < earliest) earliest = until
@@ -311,16 +363,19 @@ export async function routeOverview(
 ): Promise<WorkBuddyRouteOverview> {
   const all: WorkBuddyRouteCandidate[] = []
   for (const region of REGION_ORDER) {
-    if (options.hasModel !== undefined && !options.hasModel(region, model)) continue
+    const wireModel = wireModelFor(options, region, model)
+    if (wireModel === undefined) continue
     // Read-only: the overview is served to a polling panel.
-    all.push(...await laneCandidates(options, region, false))
+    all.push(...(await laneCandidates(options, region, false)).map(candidate => ({ ...candidate, wireModel })))
   }
 
   const snapshot = await options.health.snapshot()
   const blocked: WorkBuddyRouteOverviewEntry[] = []
   const disabled: WorkBuddyRouteOverviewEntry[] = []
   for (const candidate of all) {
-    const entry = snapshot[healthKeyOf(candidate.region, candidate.uid, model)]
+    // The panel must explain the verdict the lane actually stored; Global
+    // records Flash as `deepseek-v4.1-flash-sg`.
+    const entry = snapshot[healthKeyOf(candidate.region, candidate.uid, candidate.wireModel ?? model)]
     if (entry === undefined) continue
     if (entry.permanent === true) {
       disabled.push({

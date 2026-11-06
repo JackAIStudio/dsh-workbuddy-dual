@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { WorkBuddyDualCredentialStore } from '../src/auth.ts'
 import { WorkBuddyHealthStore, cooldownFor, healthKey } from '../src/health.ts'
 import { WorkBuddySessionAffinity, candidateKey, planRoute, routeOverview } from '../src/router.ts'
+import { crossLaneWireModel, laneServesModel } from '../src/model-alias.ts'
 import { createWorkBuddyDualShim, headerSafe, verdictForFailure } from '../src/shim.ts'
 import { WorkBuddyDualCatalog } from '../src/catalog.ts'
 import type { WorkBuddyCredential } from '../src/types.ts'
@@ -170,6 +171,60 @@ describe('automatic account routing', () => {
     expect(order.map(candidate => candidate.region)).toEqual(['cn'])
   })
 
+  it('falls back to Global when CN is limited and the product has another id there', async () => {
+    // The real catalogs: CN calls Flash `deepseek-v4.1-flash`, Global calls the
+    // same product `deepseek-v4.1-flash-sg`. Requiring the id verbatim dropped
+    // Global entirely and the turn failed while two Global accounts were free.
+    const store = await buildStore()
+    await store.poolFor('cn').upsert(credential('cn', 'cn-a'))
+    await store.poolFor('global').upsert(credential('global', 'gl-a'))
+
+    const health = new WorkBuddyHealthStore({ path: join(dir, 'health.json') })
+    await health.record('cn', 'cn-a', FLASH, 'rate-limited', { resetsAtMs: Date.now() + 3_600_000 })
+
+    const order = await planRoute(
+      {
+        store,
+        client: { refreshToken: async () => ({ accessToken: 'x' }) } as never,
+        health,
+        credits: () => 100,
+        hasModel: (region, model) => laneServesModel(
+          (lane, id) => (lane === 'cn'
+            ? id === 'deepseek-v4.1-flash' || id === 'kimi-k3-1'
+            : id === 'deepseek-v4.1-flash-sg' || id === 'gpt-6-astra'),
+          region,
+          model,
+        ),
+        resolveModel: (region, model) => crossLaneWireModel(
+          (lane, id) => (lane === 'cn'
+            ? id === 'deepseek-v4.1-flash' || id === 'kimi-k3-1'
+            : id === 'deepseek-v4.1-flash-sg' || id === 'gpt-6-astra'),
+          region,
+          model,
+        ),
+      },
+      new WorkBuddySessionAffinity(),
+      { model: FLASH },
+    )
+
+    expect(order.map(candidate => candidateKey(candidate.region, candidate.uid))).toEqual(['global/gl-a'])
+    // The Global candidate carries the id that lane actually serves.
+    expect(order[0]?.wireModel).toBe('deepseek-v4.1-flash-sg')
+  })
+
+  it('keeps the requested id on a lane that serves it directly', async () => {
+    expect(crossLaneWireModel(() => true, 'cn', FLASH)).toBe(FLASH)
+    expect(crossLaneWireModel((_lane, id) => id === FLASH, 'global', FLASH)).toBe(FLASH)
+    // "Can this lane serve it" and "what id do I send" are different answers:
+    // CN serves the Flash product only as `deepseek-v4.1-flash`, and a
+    // Global-only model has no CN equivalent at all.
+    const cnOnly = (_lane: string, id: string) => id === FLASH
+    expect(laneServesModel(cnOnly as never, 'cn', FLASH)).toBe(true)
+    expect(crossLaneWireModel(cnOnly as never, 'cn', FLASH)).toBe(FLASH)
+    expect(laneServesModel(cnOnly as never, 'cn', 'gpt-6-astra')).toBe(false)
+    expect(crossLaneWireModel(cnOnly as never, 'cn', 'gpt-6-astra')).toBeUndefined()
+  })
+
   it('tries a new account before writing it off for an unknown balance', async () => {
     const store = await buildStore()
     await store.poolFor('cn').upsert(credential('cn', 'cn-known'))
@@ -208,6 +263,34 @@ describe('automatic account routing', () => {
     expect(view.order).toEqual([])
     expect(view.blocked).toHaveLength(2)
     expect(view.nextRecoveryMs).toBe(sooner)
+  })
+
+  it('reports the far lane recovery when that lane names the model differently', async () => {
+    const store = await buildStore()
+    await store.poolFor('cn').upsert(credential('cn', 'cn-a'))
+    await store.poolFor('global').upsert(credential('global', 'gl-a'))
+
+    const health = new WorkBuddyHealthStore({ path: join(dir, 'health.json') })
+    const cnReset = Date.now() + 3_600_000
+    const glReset = Date.now() + 600_000
+    await health.record('cn', 'cn-a', FLASH, 'rate-limited', { resetsAtMs: cnReset })
+    // The Global gateway files its verdict under the id it actually runs.
+    await health.record('global', 'gl-a', 'deepseek-v4.1-flash-sg', 'rate-limited', { resetsAtMs: glReset })
+
+    const resolveModel = (region: 'cn' | 'global', model: string) => crossLaneWireModel(
+      (lane, id) => (lane === 'cn' ? id === FLASH : id === 'deepseek-v4.1-flash-sg'),
+      region,
+      model,
+    )
+    const view = await routeOverview(
+      { store, client: { refreshToken: async () => ({ accessToken: 'x' }) } as never, health, resolveModel },
+      FLASH,
+    )
+
+    expect(view.order).toEqual([])
+    // Both lanes are waiting; the sooner one is Global's own id, not CN's.
+    expect(view.nextRecoveryMs).toBe(glReset)
+    expect(view.blocked.map(entry => entry.uid).sort()).toEqual(['cn-a', 'gl-a'])
   })
 
   it('treats a clamped cooldown sanely and forgets a verdict once it expires', async () => {
@@ -344,6 +427,70 @@ describe('shim switches accounts before answering', () => {
       // The blocked account is remembered for this model, not for every model.
       expect(await health.isBlocked('cn', 'cn-blocked', FLASH)).toBe(true)
       expect(await health.isBlocked('cn', 'cn-blocked', 'gpt-6-astra')).toBe(false)
+    } finally {
+      await shim.close()
+    }
+  })
+
+  it('rewrites the model id when the fallback lane publishes it under another name', async () => {
+    const store = await buildStore()
+    await store.poolFor('cn').upsert(credential('cn', 'cn-blocked'))
+    await store.poolFor('global').upsert(credential('global', 'gl-ok'))
+
+    const health = new WorkBuddyHealthStore({ path: join(dir, 'health.json') })
+    const sent: Array<{ region: string; model: unknown }> = []
+    const client = {
+      async refreshToken() { return { accessToken: 'x' } },
+      async chatStream(cred: WorkBuddyCredential, body: string) {
+        sent.push({ region: cred.region, model: (JSON.parse(body) as { model: unknown }).model })
+        return cred.uid === 'cn-blocked'
+          ? { ok: true as const, response: sseBlocked() }
+          : { ok: true as const, response: sseOk('hello') }
+      },
+    }
+
+    const shim = createWorkBuddyDualShim({
+      store,
+      client: client as never,
+      catalog: new WorkBuddyDualCatalog(),
+      route: {
+        router: {
+          store,
+          client: client as never,
+          health,
+          credits: () => 100,
+          hasModel: (region, model) => laneServesModel(
+            (lane, id) => (lane === 'cn' ? id === FLASH : id === 'deepseek-v4.1-flash-sg'),
+            region,
+            model,
+          ),
+          resolveModel: (region, model) => crossLaneWireModel(
+            (lane, id) => (lane === 'cn' ? id === FLASH : id === 'deepseek-v4.1-flash-sg'),
+            region,
+            model,
+          ),
+        },
+        affinity: new WorkBuddySessionAffinity(),
+        crossLaneFrom: 'cn',
+      },
+    })
+
+    await shim.ready
+    try {
+      const response = await fetch(`${shim.origin}/cn/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-session-affinity': 's1' },
+        body: JSON.stringify({ model: FLASH, messages: [{ role: 'user', content: 'hi' }] }),
+      })
+      expect(response.status).toBe(200)
+      expect(await response.text()).toContain('hello')
+      expect(sent).toEqual([
+        { region: 'cn', model: FLASH },
+        { region: 'global', model: 'deepseek-v4.1-flash-sg' },
+      ])
+      // The verdict is filed under the id the lane runs, so the router can
+      // find it again next turn.
+      expect(await health.isBlocked('cn', 'cn-blocked', FLASH)).toBe(true)
     } finally {
       await shim.close()
     }

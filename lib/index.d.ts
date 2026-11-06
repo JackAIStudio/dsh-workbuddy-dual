@@ -371,6 +371,13 @@ interface WorkBuddyRouteCandidate {
   source: 'pool' | 'fallback';
   label: string;
   credits?: number | undefined;
+  /**
+   * Model id to send to this lane, which may differ from the requested one.
+   *
+   * Flash is `deepseek-v4.1-flash` on CN and `deepseek-v4.1-flash-sg` on
+   * Global. The shim rewrites the body's `model` per candidate with this.
+   */
+  wireModel?: string | undefined;
 }
 interface WorkBuddyRouteRequest {
   model: string;
@@ -399,11 +406,25 @@ interface WorkBuddyRouterOptions {
   /**
    * Whether this lane's catalog offers the model at all.
    *
-   * Crossing lanes is only useful for models both gateways serve — Flash is on
-   * both. A CN-only model (Kimi) has no Global equivalent, and sending it there
-   * would trade a rate limit for an unknown model error.
+   * Crossing lanes is only useful for models both gateways serve. A CN-only
+   * model (Kimi) has no Global equivalent, and sending it there would trade a
+   * rate limit for an unknown model error.
    */
   hasModel?: ((region: WorkBuddyRegion, model: string) => boolean) | undefined;
+  /**
+   * The model id to send to this lane, or undefined when it cannot run the
+   * product.
+   *
+   * Defaults to `hasModel`, which means "same id on both lanes". The catalog
+   * supplies a wider answer for products published under two ids (Flash is
+   * `deepseek-v4.1-flash` on CN and `deepseek-v4.1-flash-sg` on Global).
+   *
+   * This is deliberately separate from `hasModel`: asking an alias-aware
+   * predicate "does Global have deepseek-v4.1-flash?" answers yes because the
+   * alias exists, and using that answer to pick the wire id sends the CN id to
+   * Global — which the gateway rejects.
+   */
+  resolveModel?: ((region: WorkBuddyRegion, model: string) => string | undefined) | undefined;
   now?: (() => number) | undefined;
 }
 type CandidateKey = string;
@@ -516,6 +537,24 @@ declare class WorkBuddyCreditsCache {
   refresh(store: WorkBuddyDualCredentialStore, client: WorkBuddyUpstreamClient): Promise<void>;
   private run;
 }
+//#endregion
+//#region src/model-alias.d.ts
+declare const WORKBUDDY_CROSS_LANE_MODELS: Readonly<Record<string, Partial<Record<WorkBuddyRegion, string>>>>;
+/**
+ * The id `region` serves for `model`, or undefined when that lane cannot run it.
+ *
+ * A lane's own id always wins: if Global ever publishes `deepseek-v4.1-flash`
+ * itself, that is what gets sent there instead of the alias.
+ */
+declare function crossLaneWireModel(has: (region: WorkBuddyRegion, model: string) => boolean, region: WorkBuddyRegion, model: string): string | undefined;
+/**
+ * Whether `region` can serve the product at all.
+ *
+ * This is the "can this lane run it" question, not the "what id do I send"
+ * question. Both lanes answer yes for Flash; only Global's answer involves the
+ * `-sg` alias.
+ */
+declare function laneServesModel(has: (region: WorkBuddyRegion, model: string) => boolean, region: WorkBuddyRegion, model: string): boolean;
 //#endregion
 //#region src/selection-store.d.ts
 interface WorkBuddyDualSelectionStoreOptions {
@@ -780,4 +819,4 @@ declare const name = "dsh-workbuddy-dual";
 declare const inject: readonly ["llm"];
 declare function apply(ctx: Context, config?: WorkBuddyDualConfig): void;
 //#endregion
-export { AgentToolError, Config, REGION_ORDER, WORKBUDDY_CN_DISPLAY_NAME, WORKBUDDY_CN_PROVIDER, WORKBUDDY_DUAL_ACCOUNTS_PATH, WORKBUDDY_DUAL_SETTINGS_NS, WORKBUDDY_FLASH_MODEL, WORKBUDDY_GLOBAL_PROVIDER, WORKBUDDY_HEALTH_FILENAME, WORKBUDDY_NATIVE_FETCH_SERVICE, WORKBUDDY_NATIVE_SEARCH_SERVICE, WorkBuddyAccountPool, WorkBuddyCreditsCache, WorkBuddyDualCatalog, WorkBuddyDualConfig, WorkBuddyDualCredentialStore, type WorkBuddyDualSelection, WorkBuddyDualSelectionStore, WorkBuddyHealthStore, type WorkBuddyRouteCandidate, type WorkBuddyRouterOptions, WorkBuddySessionAffinity, WorkBuddyUpstreamClient, advertisedModelIds, apply, candidateKey, cooldownFor, createAccountRouteState, createAgentToolClient, createWorkBuddyDualAdapter, createWorkBuddyDualShim, createWorkBuddyNativeWeb, defaultSelection, filterModels, healthKey, inject, name, nextRecoveryMs, normalizeLanePreference, normalizeSelection, planRoute, poolDocumentPath, provideWorkBuddyNativeWeb, readAuthFile, toCredential, workBuddyAccountsView };
+export { AgentToolError, Config, REGION_ORDER, WORKBUDDY_CN_DISPLAY_NAME, WORKBUDDY_CN_PROVIDER, WORKBUDDY_CROSS_LANE_MODELS, WORKBUDDY_DUAL_ACCOUNTS_PATH, WORKBUDDY_DUAL_SETTINGS_NS, WORKBUDDY_FLASH_MODEL, WORKBUDDY_GLOBAL_PROVIDER, WORKBUDDY_HEALTH_FILENAME, WORKBUDDY_NATIVE_FETCH_SERVICE, WORKBUDDY_NATIVE_SEARCH_SERVICE, WorkBuddyAccountPool, WorkBuddyCreditsCache, WorkBuddyDualCatalog, WorkBuddyDualConfig, WorkBuddyDualCredentialStore, type WorkBuddyDualSelection, WorkBuddyDualSelectionStore, WorkBuddyHealthStore, type WorkBuddyRouteCandidate, type WorkBuddyRouterOptions, WorkBuddySessionAffinity, WorkBuddyUpstreamClient, advertisedModelIds, apply, candidateKey, cooldownFor, createAccountRouteState, createAgentToolClient, createWorkBuddyDualAdapter, createWorkBuddyDualShim, createWorkBuddyNativeWeb, crossLaneWireModel, defaultSelection, filterModels, healthKey, inject, laneServesModel, name, nextRecoveryMs, normalizeLanePreference, normalizeSelection, planRoute, poolDocumentPath, provideWorkBuddyNativeWeb, readAuthFile, toCredential, workBuddyAccountsView };

@@ -80,13 +80,17 @@ export const FALLBACK_CN_MODELS: readonly WorkBuddyModelInfo[] = [
 
 export const FALLBACK_GLOBAL_MODELS: readonly WorkBuddyModelInfo[] = [
   {
-    id: 'deepseek-v4.1-flash',
+    // The Global gateway publishes this product as `-sg`. Using the CN id in
+    // the placeholder catalog made the alias lookup answer "Global already has
+    // it", so the shim sent the CN id and the health record was filed under a
+    // name the live catalog never produces.
+    id: 'deepseek-v4.1-flash-sg',
     name: 'Deepseek-V4.1-Flash',
     contextWindow: 1_000_000,
     maxTokens: 128_000,
     supportsImages: true,
     reasoning: { supports: true, onlyReasoning: true, supportedEfforts: ['low', 'medium', 'high', 'max'], defaultEffort: 'high', canDisableThinking: false },
-    billing: { credits: 'x0.00', badges: ['Free now'], free: true },
+    billing: { credits: 'x0.11', free: false },
     region: 'global',
   },
   {

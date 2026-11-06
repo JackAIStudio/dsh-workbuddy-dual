@@ -389,6 +389,34 @@ export function prepareChatBody(source: string, region: WorkBuddyRegion = 'cn'):
 }
 
 /**
+ * Send `model` on this candidate's lane.
+ *
+ * The caller asked for the model it picked in the Harness (`deepseek-v4.1-flash`
+ * on the CN provider), while the Global catalog publishes that same product as
+ * `deepseek-v4.1-flash-sg`. Sending the lane's own id keeps the request, the
+ * billing line and the stored health verdict all naming one model. Rewriting
+ * only the `model` field keeps everything else — messages, tools, reasoning —
+ * byte for byte as the caller wrote it.
+ *
+ * When no rewrite is needed the original body is returned untouched, so the
+ * common path does not pay for a second parse.
+ */
+export function retargetChatBody(prepared: string, wireModel: string | undefined): string {
+  if (wireModel === undefined) return prepared
+  let body: unknown
+  try {
+    body = JSON.parse(prepared)
+  } catch {
+    return prepared
+  }
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) return prepared
+  const obj = body as Record<string, unknown>
+  if (obj['model'] === wireModel) return prepared
+  obj['model'] = wireModel
+  return JSON.stringify(obj)
+}
+
+/**
  * Read the first upstream frame without committing a response to the client.
  *
  * The gateway answers a rate-limited stream with HTTP 200 and an SSE frame
@@ -635,7 +663,11 @@ export function createWorkBuddyDualShim(options: WorkBuddyDualShimOptions): Work
     let lastError: { status: number; kind: string; message: string } | undefined
     for (const candidate of candidates) {
       if (controller.signal.aborted) return
-      const prepared = prepareChatBody(raw, candidate.region)
+      // The health verdict belongs to the id this lane actually runs, which is
+      // how the router will look it up on the next turn.
+      const wireModel = candidate.wireModel
+      const prepared = retargetChatBody(prepareChatBody(raw, candidate.region), wireModel)
+      const healthModel = wireModel ?? model ?? preparedModel(prepared)
       const result = await client.chatStream(candidate.credential, prepared, controller.signal)
       if (!result.ok) {
         logUpstreamRejection(logger, candidate.region, body.length, result.status, result.message)
@@ -645,7 +677,7 @@ export function createWorkBuddyDualShim(options: WorkBuddyDualShimOptions): Work
         // just burn the remaining accounts' rate budget.
         const retriable = result.kind === 'rate' || result.kind === 'auth' || result.kind === 'credit'
         if (route !== undefined) {
-          await route.router.health.record(candidate.region, candidate.uid, model ?? preparedModel(prepared), verdictForFailure(result.kind, result.message), {
+          await route.router.health.record(candidate.region, candidate.uid, healthModel, verdictForFailure(result.kind, result.message), {
             resetsAtMs: parseResetTime(result.message),
             detail: result.message.slice(0, 200),
           })
@@ -661,7 +693,7 @@ export function createWorkBuddyDualShim(options: WorkBuddyDualShimOptions): Work
         const verdict = peek.code === '11140' ? 'banned' : peek.code === '14018' ? 'no-credit' : 'rate-limited'
         await peek.reader.cancel().catch(() => {})
         if (route !== undefined) {
-          await route.router.health.record(candidate.region, candidate.uid, model ?? preparedModel(prepared), verdict, {
+          await route.router.health.record(candidate.region, candidate.uid, healthModel, verdict, {
             resetsAtMs: parseResetTime(peek.head),
             detail: peek.head.slice(0, 200),
           })
@@ -671,7 +703,7 @@ export function createWorkBuddyDualShim(options: WorkBuddyDualShimOptions): Work
       }
 
       if (route !== undefined) {
-        await route.router.health.record(candidate.region, candidate.uid, model ?? preparedModel(prepared), 'ok')
+        await route.router.health.record(candidate.region, candidate.uid, healthModel, 'ok')
         route.affinity.remember(sessionKey, candidate.region, candidate.uid)
       }
 

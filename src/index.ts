@@ -30,6 +30,7 @@ import { createWorkBuddyNativeWeb, provideWorkBuddyNativeWeb } from './native-we
 import { WORKBUDDY_FLASH_MODEL } from './account-paths.ts'
 import { WorkBuddyHealthStore } from './health.ts'
 import { WorkBuddyCreditsCache } from './credits-cache.ts'
+import { crossLaneWireModel, laneServesModel } from './model-alias.ts'
 import { WorkBuddySessionAffinity, routeOverview } from './router.ts'
 import { WorkBuddyRouterSettingsStore } from './router-settings.ts'
 import type { WorkBuddyRouteOptions } from './shim.ts'
@@ -56,6 +57,11 @@ export {
   type WorkBuddyRouterOptions,
 } from './router.ts'
 export { WorkBuddyCreditsCache } from './credits-cache.ts'
+export {
+  WORKBUDDY_CROSS_LANE_MODELS,
+  crossLaneWireModel,
+  laneServesModel,
+} from './model-alias.ts'
 export { WorkBuddyDualSelectionStore } from './selection-store.ts'
 export { WorkBuddyAccountPool, poolDocumentPath, toCredential } from './accounts.ts'
 export {
@@ -109,13 +115,29 @@ export function apply(ctx: Context, config: WorkBuddyDualConfig = {}): void {
   const credits = new WorkBuddyCreditsCache()
   const affinity = new WorkBuddySessionAffinity()
   const routerSettings = new WorkBuddyRouterSettingsStore()
+  /**
+   * The catalog decides which lane can run a model, including the pairs that
+   * publish one product under two ids (`deepseek-v4.1-flash` / `-sg`).
+   * Answering with a bare `id === model` is what silently disabled the Global
+   * fallback for Flash. `crossLaneFrom: 'cn'` keeps the reverse direction
+   * closed, so a Global-only model still never lands on a CN account.
+   */
+  const hasModel = (region: WorkBuddyRegion, model: string): boolean =>
+    laneServesModel((lane, id) => catalog.modelsFor(lane).some(info => info.id === id), region, model)
+  /**
+   * The id this lane must receive. The two questions are separate: a lane can
+   * serve a product without serving the caller's exact id.
+   */
+  const resolveModel = (region: WorkBuddyRegion, model: string): string | undefined =>
+    crossLaneWireModel((lane, id) => catalog.modelsFor(lane).some(info => info.id === id), region, model)
   const routeOptions: WorkBuddyRouteOptions = {
     router: {
       store,
       client,
       health,
       credits: (region, uid) => credits.get(region, uid),
-      hasModel: (region, model) => catalog.modelsFor(region).some(info => info.id === model),
+      hasModel,
+      resolveModel,
     },
     affinity,
     // Only the default entry point borrows the other lane. Picking WorkBuddy
@@ -214,7 +236,8 @@ export function apply(ctx: Context, config: WorkBuddyDualConfig = {}): void {
             client,
             health,
             credits: (region, uid) => credits.get(region, uid),
-            hasModel: (region, model) => catalog.modelsFor(region).some(info => info.id === model),
+            hasModel,
+            resolveModel,
           },
           WORKBUDDY_FLASH_MODEL,
         ),
